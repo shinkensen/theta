@@ -2,6 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    println!("{}", theta_lib::temp::get_time_now());
-    //theta_lib::run()
+    theta_lib::run();
 }
