@@ -1,0 +1,5 @@
+# Tauri's dev watcher rebuilds the app on any change under src-tauri/.
+# Recordings no longer get written here (see Recording.tsx / lib.rs), but
+# this stays as a backstop in case that ever changes again.
+theta_recordings/
+*.wav

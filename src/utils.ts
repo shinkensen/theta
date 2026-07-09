@@ -1,7 +1,6 @@
 
 
 
-export const quickSearch = async (_content: string) => {
-  // placeholder for future search logic
-  return;
-};
+export const quickSearch = async(content:string) =>{
+    
+}

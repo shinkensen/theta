@@ -1,0 +1,153 @@
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 427b563..55fe788 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -83,16 +83,8 @@ fn list_directory(path: String) -> Result<Vec<String>, String> {
+     Ok(result)
+ }
+ 
+-fn ensure_recordings_dir() {
+-    let dir = std::path::Path::new("theta_recordings");
+-    if !dir.exists() {
+-        let _ = std::fs::create_dir_all(dir);
+-    }
+-}
+-
+ #[cfg_attr(mobile, tauri::mobile_entry_point)]
+ pub fn run() {
+-    ensure_recordings_dir();
+     tauri::Builder::default()
+         .plugin(tauri_plugin_opener::init())
+         .plugin(tauri_plugin_audio_recorder::init())
+diff --git a/src/components/Recording.tsx b/src/components/Recording.tsx
+index 38a19e4..efda712 100644
+--- a/src/components/Recording.tsx
++++ b/src/components/Recording.tsx
+@@ -336,25 +336,31 @@ type PipelineHooks = {
+ async function runPipeline(filepath: string, hooks: PipelineHooks): Promise<void> {
+   hooks.setError("");
+   hooks.setReply("");
+-  hooks.addStatus("Transcribing\u2026");
++  hooks.addStatus(`Sending audio to transcription server\u2026`);
+ 
+   const text = await getAudioTranscription(filepath);
+   if (!text.trim()) {
++    hooks.addStatus("Transcription came back empty.");
+     hooks.setError(
+       "Got an empty transcription \u2014 the recording may have been silent, " +
+         "or the transcription server didn't understand it.",
+     );
+     return;
+   }
++  hooks.addStatus(`Transcribed: "${text}"`);
+   hooks.setTranscript(text);
+ 
+-  hooks.addStatus("Thinking\u2026");
++  hooks.addStatus(`Asking ${MODEL}\u2026`);
+   const reply = await ask(text, hooks.addStatus);
+ 
+   if (reply) {
++    hooks.addStatus(`Reply: "${reply}"`);
+     hooks.setReply(reply);
+-    hooks.addStatus("Speaking\u2026");
++    hooks.addStatus("Speaking reply via Azure TTS\u2026");
+     await speakText(reply);
++    hooks.addStatus("Playback finished.");
++  } else {
++    hooks.addStatus("Model returned no reply text.");
+   }
+   hooks.addStatus("Done.");
+ }
+@@ -370,24 +376,36 @@ export default function Recording() {
+   // Refs so async chains see the latest values without stale closures.
+   const recordingRef = useRef(false);
+   const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
++  const logEndRef = useRef<HTMLDivElement>(null);
+ 
+   function addStatus(s: string) {
+-    setStatusLog((prev) => [...prev.slice(-6), s]);
++    const line = `${new Date().toLocaleTimeString()}  ${s}`;
++    console.log(`[theta] ${s}`);
++    setStatusLog((prev) => [...prev.slice(-14), line]);
+   }
+ 
++  useEffect(() => {
++    logEndRef.current?.scrollIntoView({ block: "nearest" });
++  }, [statusLog]);
++
+   async function startAndScheduleStop() {
+     setError("");
+     setStatusLog([]);
+     setRecording(true);
+     recordingRef.current = true;
+ 
+-    // Build a filesystem-safe filename; the recorder writes to outputPath.
+-    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+-    const outputPath = `theta_recordings/voice_sample_${ts}.wav`;
++    addStatus("Recording started");
+ 
+     try {
++      // Empty outputPath means the plugin writes to the OS temp dir with an
++      // auto-generated name. We deliberately don't build our own path: the
++      // plugin always appends ".wav" itself (its RecordingConfig doc says
++      // the path should be given "without extension" -- passing one that
++      // already ended in .wav is what produced the "...wav.wav" files),
++      // and writing anywhere under src-tauri/ is exactly what makes Tauri's
++      // dev watcher rebuild the whole app on every single recording.
+       await startRecording({
+-        outputPath,
++        outputPath: "",
+         format: "wav",
+         quality: "high",
+         maxDuration: 0,
+@@ -420,6 +438,10 @@ export default function Recording() {
+     let result: RecordingResult | null = null;
+     try {
+       result = await stopRecording();
++      addStatus(
++        `Recording stopped: ${(result.durationMs / 1000).toFixed(1)}s, ` +
++          `${(result.fileSize / 1024).toFixed(1)} KB`,
++      );
+     } catch (e) {
+       setError(
+         `Failed to stop recording: ${e instanceof Error ? e.message : String(e)}`,
+@@ -520,10 +542,24 @@ export default function Recording() {
+       )}
+ 
+       {statusLog.length > 0 && (
+-        <div className="card" style={{ fontFamily: "monospace", fontSize: 13 }}>
+-          {statusLog.map((s, i) => (
+-            <div key={i}>{s}</div>
+-          ))}
++        <div className="card">
++          <strong>Progress</strong>
++          <div
++            style={{
++              marginTop: 8,
++              maxHeight: 180,
++              overflowY: "auto",
++              fontFamily: "monospace",
++              fontSize: 12.5,
++              lineHeight: 1.6,
++              color: "#b0b0c0",
++            }}
++          >
++            {statusLog.map((s, i) => (
++              <div key={i}>{s}</div>
++            ))}
++            <div ref={logEndRef} />
++          </div>
+         </div>
+       )}
+ 
+diff --git a/src-tauri/.taurignore b/src-tauri/.taurignore
+new file mode 100644
+index 0000000..2ec9562
+--- /dev/null
++++ b/src-tauri/.taurignore
+@@ -0,0 +1,5 @@
++# Tauri's dev watcher rebuilds the app on any change under src-tauri/.
++# Recordings no longer get written here (see Recording.tsx / lib.rs), but
++# this stays as a backstop in case that ever changes again.
++theta_recordings/
++*.wav
