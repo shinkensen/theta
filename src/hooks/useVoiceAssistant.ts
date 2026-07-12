@@ -37,24 +37,76 @@ let conversation: Array<{
     },
   ];
 
-function speak(text: string): Promise<void> {
+// Chromium-based webviews (which Tauri uses on Windows/Linux) populate the
+// voice list asynchronously — on first call `getVoices()` often returns []
+// and the utterance gets silently dropped rather than throwing. This waits
+// for the `voiceschanged` event (with a timeout fallback) before speaking.
+function getVoicesAsync(): Promise<SpeechSynthesisVoice[]> {
   return new Promise((resolve) => {
-    if (!window.speechSynthesis) {
-      console.warn("Speech synthesis not supported in this environment");
-      resolve();
+    const existing = window.speechSynthesis.getVoices();
+    if (existing.length > 0) {
+      resolve(existing);
       return;
     }
+    const timeout = setTimeout(() => {
+      window.speechSynthesis.onvoiceschanged = null;
+      resolve(window.speechSynthesis.getVoices());
+    }, 1000);
+    window.speechSynthesis.onvoiceschanged = () => {
+      clearTimeout(timeout);
+      window.speechSynthesis.onvoiceschanged = null;
+      resolve(window.speechSynthesis.getVoices());
+    };
+  });
+}
 
+async function speak(text: string): Promise<void> {
+  if (!window.speechSynthesis) {
+    console.warn("Speech synthesis not supported in this environment");
+    return;
+  }
 
+  // Clear anything stuck in the queue (e.g. from StrictMode double-invokes
+  // or overlapping replies) — otherwise speak() below just queues silently
+  // behind a dead utterance and nothing audible happens.
+  window.speechSynthesis.cancel();
 
+  const voices = await getVoicesAsync();
+
+  return new Promise((resolve) => {
     const utterance = new SpeechSynthesisUtterance(text);
-    // You can customize the voice here by selecting from window.speechSynthesis.getVoices()
-    utterance.onend = () => resolve();
-    utterance.onerror = (e) => {
-      console.error("Speech synthesis error:", e);
+    if (voices.length > 0) {
+      const preferred =
+        voices.find((v) => v.lang?.startsWith("en") && v.localService) ??
+        voices.find((v) => v.lang?.startsWith("en")) ??
+        voices[0];
+      utterance.voice = preferred;
+    }
+    utterance.rate = 1;
+    utterance.pitch = 1;
+    utterance.volume = 1;
+
+    utterance.onstart = () => console.debug("[tts] speaking started");
+    utterance.onend = () => {
+      console.debug("[tts] speaking finished");
       resolve();
     };
+    utterance.onerror = (e) => {
+      console.error("Speech synthesis error:", e.error ?? e);
+      resolve();
+    };
+
     window.speechSynthesis.speak(utterance);
+
+    // Some webviews (esp. WebKitGTK on Linux) silently no-op speak() without
+    // ever firing onstart/onend — bail out after a timeout so the UI isn't
+    // stuck in "speaking" forever.
+    setTimeout(() => {
+      if (!window.speechSynthesis.speaking) {
+        console.warn("[tts] speak() produced no audio — resolving anyway");
+        resolve();
+      }
+    }, 500);
   });
 }
 
@@ -138,7 +190,6 @@ export function useVoiceAssistant() {
           const reply = await ask(text);
           addEntry("assistant", reply);
           setPhase("speaking");
-          // Disabled TTS as requested: just show in chat
           await speak(reply);
         } catch (error) {
           console.error("Failed to get a response:", error);
