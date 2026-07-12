@@ -74,13 +74,18 @@ function Dial({
 }
 
 function App() {
-  const { status, partial, transcript, errorMessage, toggleListening } =
+  const { status, partial, transcript, errorMessage, toggleListening, debugLogs } =
     useVoiceAssistant();
   const logEndRef = useRef<HTMLDivElement>(null);
+  const debugEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [transcript, partial]);
+
+  useEffect(() => {
+    debugEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [debugLogs]);
 
   return (
     <div className="app">
@@ -128,6 +133,13 @@ function App() {
       )}
 
       <footer className="console">
+        <div className="debug-panel">
+          {debugLogs.length === 0 && <div className="debug-panel__empty">Awaiting telemetry...</div>}
+          {debugLogs.map((log, i) => (
+            <div key={i} className="debug-panel__line">{log}</div>
+          ))}
+          <div ref={debugEndRef} />
+        </div>
         <Dial status={status} onPress={toggleListening} />
       </footer>
     </div>

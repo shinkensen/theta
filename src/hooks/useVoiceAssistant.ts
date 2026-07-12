@@ -1,39 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { OpenRouter } from "@openrouter/sdk";
-import * as SpeechSDK from "microsoft-cognitiveservices-speech-sdk";
-
-// IMPORTANT: move these to env vars (or a backend proxy) before shipping.
-// Anything embedded in a desktop app bundle is extractable from the
-// binary regardless of .env — rotate any key that's ever been pasted
-// into a chat, commit, or log.
-const OPENROUTER_API_KEY = import.meta.env.VITE_OPENROUTER_API_KEY as string || "";
-const AZURE_SPEECH_KEY = import.meta.env.VITE_AZURE_SPEECH_KEY as string;
-const AZURE_SPEECH_REGION = "eastus";
-
-const client = new OpenRouter({
-  apiKey: OPENROUTER_API_KEY ,
-  serverURL: "https://ai.hackclub.com/proxy/v1",
+import Cerebras from '@cerebras/cerebras_cloud_sdk';
+// Web search is OPTIONAL context for the model. If the search API is
+// unconfigured (no key) or unreachable, we fall back to answering without
+// it rather than killing the whole voice loop. Note: this runs in the
+// webview, so we read the key from `import.meta.env` (Vite) — `process.env`
+// does not exist in the browser.
+const client = new Cerebras({
+  apiKey: import.meta.env.VITE_CEREBRAS_API_KEY,
+  dangerouslyAllowBrowser: true,
 });
-
-const speechConfig = SpeechSDK.SpeechConfig.fromSubscription(
-  AZURE_SPEECH_KEY,
-  AZURE_SPEECH_REGION
-);
-speechConfig.speechSynthesisVoiceName = "en-US-AvaNeural";
-
-async function searchWeb(query: string) {
-  const res = await fetch(
-    `https://search.hackclub.com/res/v1/web/search?q=${encodeURIComponent(query)}&count=5`,
-    {
-      headers: {
-        Authorization: `Bearer ${process.env.HACK_CLUB_SEARCH_API_KEY}`,
-      },
-    }
-  );
-  return res.json();
-}
 export type AssistantStatus =
   | "standby"
   | "listening"
@@ -53,50 +30,63 @@ let conversation: Array<{
   role: "system" | "user" | "assistant";
   content: string;
 }> = [
-  {
-    role: "system",
-    content:
-      "You are a helpful voice assistant. Keep replies short and conversational — they will be read aloud.",
-  },
-];
+    {
+      role: "system",
+      content:
+        "You are a helpful voice assistant. Keep replies short and conversational — they will be read aloud.",
+    },
+  ];
 
 function speak(text: string): Promise<void> {
   return new Promise((resolve) => {
-    const audioConfig = SpeechSDK.AudioConfig.fromDefaultSpeakerOutput();
-    const synthesizer = new SpeechSDK.SpeechSynthesizer(speechConfig, audioConfig);
-    synthesizer.speakTextAsync(
-      text,
-      (result) => {
-        if (result.reason !== SpeechSDK.ResultReason.SynthesizingAudioCompleted) {
-          console.error("Speech synthesis canceled:", result.errorDetails);
-        }
-        synthesizer.close();
-        resolve();
-      },
-      (err) => {
-        console.error("Speech synthesis error:", err);
-        synthesizer.close();
-        resolve();
-      }
-    );
+    if (!window.speechSynthesis) {
+      console.warn("Speech synthesis not supported in this environment");
+      resolve();
+      return;
+    }
+
+
+
+    const utterance = new SpeechSynthesisUtterance(text);
+    // You can customize the voice here by selecting from window.speechSynthesis.getVoices()
+    utterance.onend = () => resolve();
+    utterance.onerror = (e) => {
+      console.error("Speech synthesis error:", e);
+      resolve();
+    };
+    window.speechSynthesis.speak(utterance);
   });
 }
 
 async function ask(userText: string): Promise<string> {
-  const searchResults = await searchWeb(userText);
-  
-  // 2. Format results for the prompt
-  const context = searchResults.web?.results
-    ?.map((r: any) => `[${r.title}](${r.url})\n${r.description}`)
-    .join('\n\n');
-  conversation.push({ role: "user", content: `${userText}   Use the following search results to base your answer: ${context}`});
-  const res = await client.chat.send({
-    chatRequest: {
-      model: "openai/gpt-oss-120b:free",
-      messages: conversation,
-    },
+  // Search is best-effort context; never let it abort the conversation.
+  let context = ""
+  const userContent = userText;
+  conversation.push({ role: "user", content: userContent });
+  const res: any = await client.chat.completions.create({
+    model: 'gpt-oss-120b',
+    messages: conversation
   });
-  const reply = res.choices[0].message.content;
+  ;
+
+  // content can be string | Array<...> | null — extract plain text safely
+  const rawContent = res.choices[0]?.message?.content;
+  let reply: string;
+  if (typeof rawContent === "string") {
+    reply = rawContent;
+  } else if (Array.isArray(rawContent)) {
+    reply = rawContent
+      .filter((part: { type?: string; text?: string }) => part?.type === "text")
+      .map((part: { text?: string }) => part?.text ?? "")
+      .join("");
+  } else {
+    reply = "Sorry, I couldn't generate a response.";
+  }
+
+  if (!reply.trim()) {
+    reply = "Sorry, I couldn't generate a response.";
+  }
+
   conversation.push({ role: "assistant", content: reply });
   return reply;
 }
@@ -109,6 +99,7 @@ export function useVoiceAssistant() {
   const [partial, setPartial] = useState("");
   const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
   const [errorMessage, setErrorMessage] = useState("");
+  const [debugLogs, setDebugLogs] = useState<string[]>([]);
   const processingRef = useRef(false);
 
   const addEntry = useCallback((role: TranscriptEntry["role"], text: string) => {
@@ -127,6 +118,7 @@ export function useVoiceAssistant() {
     let unlistenPartial: UnlistenFn | undefined;
     let unlistenResult: UnlistenFn | undefined;
     let unlistenError: UnlistenFn | undefined;
+    let unlistenDebug: UnlistenFn | undefined;
     let cancelled = false;
 
     (async () => {
@@ -146,6 +138,7 @@ export function useVoiceAssistant() {
           const reply = await ask(text);
           addEntry("assistant", reply);
           setPhase("speaking");
+          // Disabled TTS as requested: just show in chat
           await speak(reply);
         } catch (error) {
           console.error("Failed to get a response:", error);
@@ -162,14 +155,24 @@ export function useVoiceAssistant() {
         setIsListening(false);
       });
 
+      const d = await listen<string>("theta-debug", (event) => {
+        setDebugLogs((prev) => {
+          const next = [...prev, event.payload];
+          if (next.length > 50) return next.slice(next.length - 50); // Keep last 50 logs
+          return next;
+        });
+      });
+
       if (cancelled) {
         p();
         r();
         e();
+        d();
       } else {
         unlistenPartial = p;
         unlistenResult = r;
         unlistenError = e;
+        unlistenDebug = d;
       }
     })();
 
@@ -178,6 +181,7 @@ export function useVoiceAssistant() {
       unlistenPartial?.();
       unlistenResult?.();
       unlistenError?.();
+      unlistenDebug?.();
     };
   }, [addEntry]);
 
@@ -203,10 +207,10 @@ export function useVoiceAssistant() {
   const status: AssistantStatus = errorMessage
     ? "error"
     : phase !== "idle"
-    ? phase
-    : isListening
-    ? "listening"
-    : "standby";
+      ? phase
+      : isListening
+        ? "listening"
+        : "standby";
 
-  return { status, partial, transcript, errorMessage, toggleListening };
+  return { status, partial, transcript, errorMessage, toggleListening, debugLogs };
 }
