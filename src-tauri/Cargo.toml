@@ -23,6 +23,7 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hostname = "0.4"
+vosk = "0.3"
 cpal = "=0.18.0"
 # Pin windows crates to a single minor so cpal's `>=0.61, <=0.62` ranges
 # resolve consistently (cpal allows windows 0.61.3 + windows-core 0.62.2,
@@ -30,7 +31,3 @@ cpal = "=0.18.0"
 windows = "0.61"
 windows-core = "0.61"
 crossbeam-channel = "0.5"
-tokio = { version = "1", features = ["full"] }
-rodio = "0.18"
-hound = "3"
-whisper-rs = "0.13"
