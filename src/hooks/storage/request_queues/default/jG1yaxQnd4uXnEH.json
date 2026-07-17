@@ -1,0 +1,9 @@
+{
+	"id": "jG1yaxQnd4uXnEH",
+	"json": "{\"id\":\"jG1yaxQnd4uXnEH\",\"url\":\"https://www.forbes.com/companies/apple/\",\"loadedUrl\":\"https://www.forbes.com/companies/apple/\",\"uniqueKey\":\"https://www.forbes.com/companies/apple\",\"method\":\"GET\",\"noRetry\":false,\"retryCount\":0,\"errorMessages\":[],\"headers\":{},\"userData\":{\"__crawlee\":{\"state\":4}},\"handledAt\":\"2026-07-17T03:21:18.800Z\"}",
+	"method": "GET",
+	"orderNo": null,
+	"retryCount": 0,
+	"uniqueKey": "https://www.forbes.com/companies/apple",
+	"url": "https://www.forbes.com/companies/apple/"
+}

@@ -1,0 +1,9 @@
+{
+	"id": "riwhhL620mTAGyI",
+	"json": "{\"id\":\"riwhhL620mTAGyI\",\"url\":\"https://en.wikipedia.org/wiki/Apple_Inc.\",\"loadedUrl\":\"https://en.wikipedia.org/wiki/Apple_Inc.\",\"uniqueKey\":\"https://en.wikipedia.org/wiki/Apple_Inc.\",\"method\":\"GET\",\"noRetry\":false,\"retryCount\":0,\"errorMessages\":[],\"headers\":{},\"userData\":{\"__crawlee\":{\"state\":4}},\"handledAt\":\"2026-07-17T03:21:18.562Z\"}",
+	"method": "GET",
+	"orderNo": null,
+	"retryCount": 0,
+	"uniqueKey": "https://en.wikipedia.org/wiki/Apple_Inc.",
+	"url": "https://en.wikipedia.org/wiki/Apple_Inc."
+}

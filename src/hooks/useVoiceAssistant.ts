@@ -18,9 +18,53 @@ import Cerebras from '@cerebras/cerebras_cloud_sdk';
 // fetch avoids the problem entirely since the REST API is just JSON over
 // HTTPS.
 const FIRECRAWL_API_KEY = import.meta.env.VITE_FIRECRAWL_KEY;
+const NUM_RESULTS_WEB = 3;
 
-async function searchTheWeb(query: string, limit = 1) {
+interface FirecrawlSearchResult {
+  url: string;
+  title?: string;
+  description?: string;
+  markdown?: string;
+}
+
+// These sites tend to scrape into enormous, noisy markdown (embedded
+// JSON, related-content blocks, tracking data) that regularly blows past
+// what a single summarization request will accept — and even when it
+// doesn't, the content itself (video/audio pages) isn't usefully
+// summarizable as text anyway. Simplest fix: don't scrape them at all.
+const BLOCKED_RESULT_DOMAINS = [
+  "youtube.com",
+  "youtu.be",
+  "spotify.com",
+  "instagram.com",
+];
+
+function isBlockedDomain(url: string): boolean {
   try {
+    const hostname = new URL(url).hostname.replace(/^www\./, "");
+    return BLOCKED_RESULT_DOMAINS.some(
+      (domain) => hostname === domain || hostname.endsWith(`.${domain}`),
+    );
+  } catch {
+    return false;
+  }
+}
+
+// `scrapeOptions.formats: ["markdown"]` here means Firecrawl already scrapes
+// the *full* page for every result, not just a snippet — each result's
+// `markdown` field is the whole page. (If it looked truncated in devtools,
+// that's just the console collapsing long strings for display; the full
+// text is there.) `onlyMainContent` strips nav/header/footer boilerplate
+// before it even gets to us.
+async function searchTheWeb(
+  query: string,
+  limit = NUM_RESULTS_WEB,
+): Promise<FirecrawlSearchResult[] | string> {
+  try {
+    // Over-fetch a bit since some results get filtered out afterward —
+    // otherwise a query that happens to surface a YouTube/Spotify link
+    // would silently return fewer usable results than requested.
+    const fetchLimit = limit + 3;
     const res = await fetch("https://api.firecrawl.dev/v1/search", {
       method: "POST",
       headers: {
@@ -29,9 +73,10 @@ async function searchTheWeb(query: string, limit = 1) {
       },
       body: JSON.stringify({
         query,
-        limit,
+        limit: fetchLimit,
         scrapeOptions: {
           formats: ["markdown"],
+          onlyMainContent: true,
         },
       }),
     });
@@ -44,7 +89,8 @@ async function searchTheWeb(query: string, limit = 1) {
     if (!json.success) {
       throw new Error(json.error ?? "Firecrawl search failed");
     }
-    return json.data;
+    const results = json.data as FirecrawlSearchResult[];
+    return results.filter((r) => !isBlockedDomain(r.url)).slice(0, limit);
   } catch (error) {
     console.error("Search failed:", error);
     return `Error during search: ${error}`;
@@ -55,6 +101,48 @@ const client = new Cerebras({
   apiKey: import.meta.env.VITE_CEREBRAS_API_KEY,
   dangerouslyAllowBrowser: true,
 });
+
+// Pages like YouTube/Spotify often scrape down to markdown that's mostly
+// embedded JSON, related-content lists, and other non-visible cruft — easily
+// hundreds of KB. Truncating up front keeps the combined context small; the
+// answer we actually need is almost always near the top of the page anyway.
+//
+// NOTE: this used to run each page through its own Cerebras summarization
+// call before folding the result into the main conversation call — up to
+// 4 Cerebras requests per turn (3 pages + 1 answer). Cerebras' rate limit
+// is a shared tokens-per-minute budget across *all* requests, so that
+// pattern burned through it fast and 429'd constantly. Now there's no
+// separate summarization step at all: the truncated raw markdown for every
+// page is concatenated directly into the system message of the single main
+// call, so there's exactly one Cerebras request per turn regardless of how
+// many pages were scraped.
+//
+// Bumped from 4000 -> 9000: long-form articles (best-of listicles,
+// comparison posts) often carry a big table of contents / intro before the
+// actual useful content (e.g. a comparison table) even starts. At 4000
+// chars, that useful part was regularly getting cut off entirely — the
+// "[...truncated...]" marker was landing right before the content that
+// actually mattered. There's headroom for this since it's one combined
+// request instead of one per page now.
+const MAX_PAGE_MARKDOWN_CHARS = 9000;
+
+function truncateMarkdown(markdown: string): string {
+  if (markdown.length <= MAX_PAGE_MARKDOWN_CHARS) return markdown;
+  return markdown.slice(0, MAX_PAGE_MARKDOWN_CHARS) + "\n\n[...truncated...]";
+}
+
+// No LLM call here — just formats and truncates. Kept as its own function
+// so it's easy to swap back to per-page or batch summarization later if
+// rate limits ever stop being the binding constraint.
+function buildWebContext(results: FirecrawlSearchResult[]): string {
+  const pages = results.filter((r) => r.markdown);
+  if (pages.length === 0) return "";
+
+  return pages
+    .map((page) => `From ${page.url}:\n${truncateMarkdown(page.markdown!)}`)
+    .join("\n\n---\n\n");
+}
+
 export type AssistantStatus =
   | "standby"
   | "listening"
@@ -70,14 +158,40 @@ export interface TranscriptEntry {
 }
 
 // Module-level so it survives re-renders without extra state plumbing.
+// Broadened beyond plain {role, content} to also carry tool_calls (on
+// assistant messages that invoke search_web) and tool_call_id (on the
+// resulting tool-role messages) — see the tool-calling flow in ask().
+//
+// FIX: this used to be `new Date().getDate().toString()`, which is only
+// the day-of-month integer (e.g. "17") — no month, no year. The model had
+// no way to know it was actually mid-2026, so left to its own devices it
+// defaulted to its training-era assumption and searched for "2024" instead
+// of the current year. Using a full formatted date (with year) fixes that
+// at the source.
+const now = new Date();
+const currentDateString = now.toLocaleDateString("en-US", {
+  weekday: "long",
+  year: "numeric",
+  month: "long",
+  day: "numeric",
+});
 let conversation: Array<{
-  role: "system" | "user" | "assistant";
+  role: "system" | "user" | "assistant" | "tool";
   content: string;
+  tool_calls?: any[];
+  tool_call_id?: string;
 }> = [
     {
       role: "system",
       content:
-        "You are a helpful voice assistant. Keep replies short and conversational — they will be read aloud.",
+        `You are a helpful voice assistant. Today's date is ${currentDateString}. Trust this date over ` +
+        "whatever year you'd otherwise assume — your training data has a cutoff well before today, so don't " +
+        "default to an old year when forming search queries or answering questions about what's current. " +
+        "DO NOT INCLUDE FORMATTING. Keep replies short and conversational — they will be read aloud. " +
+        "You have a search_web tool available. Call it whenever you want, in fact, use it for most queries. " +
+        "Particularly information you don't already know or things that change rapidly — tech, news, prices, " +
+        "recent events, specific facts. Don't use it for things you can already answer, general conversation, " +
+        "or something already searched earlier in this conversation.",
     },
   ];
 
@@ -217,7 +331,7 @@ async function synthesizeEdgeTTS(text: string): Promise<Blob> {
       const ssml =
         `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>` +
         `<voice name='${EDGE_TTS_VOICE}'>` +
-        `<prosody pitch='+0Hz' rate='+0%' volume='+0%'>${escapeSsml(text)}</prosody>` +
+        `<prosody pitch='+0Hz' rate='+40%' volume='+0%'>${escapeSsml(text)}</prosody>` +
         `</voice></speak>`;
       ws.send(
         `X-RequestId:${requestId}\r\n` +
@@ -362,38 +476,101 @@ async function speak(text: string): Promise<void> {
   await speakWebFallback(text);
 }
 
-async function ask(userText: string): Promise<string> {
-  // Search is best-effort context; never let it abort the conversation.
-  const context = await searchTheWeb(userText);
-  const userContent = userText;
-  conversation.push({ role: "user", content: userContent });
-  const tempMessages = [
-    ...conversation.slice(0, -1), // all previous messages except the last user message
-    {
-      role: "system",
-      content: `Here is relevant web context to help answer the user's next message: ${JSON.stringify(context)}`,
+// Given to the model as a callable tool rather than running automatically
+// on every turn. Cerebras' gpt-oss-120b supports OpenAI-style tool calling,
+// so the model itself decides — based on the conversation so far — whether
+// a given question actually needs a web search, and skips it for anything
+// it can already answer (chit-chat, follow-ups, things already searched
+// earlier in the same conversation).
+const SEARCH_TOOL_DEFINITION = {
+  type: "function",
+  function: {
+    name: "search_web",
+    description:
+      "Search the web and return content from a few relevant pages. Use whenever you want, in fact, use it for most queries. " +
+      "Particularly information you don't already know or things that change rapidly — tech, news, prices, recent events, specific facts. " +
+      "Dont use it for things you can already answer, general conversation, or something already searched earlier " +
+      "in this conversation.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description: "The search query.",
+        },
+      },
+      required: ["query"],
     },
-    conversation[conversation.length - 1], // the user's actual message, last
-  ];
-  const res: any = await client.chat.completions.create({
-    model: 'gpt-oss-120b',
-    messages: tempMessages as any,
-  });
+  },
+};
 
-  // content can be string | Array<...> | null — extract plain text safely
-  const rawContent = res.choices[0]?.message?.content;
-  let reply: string;
-  if (typeof rawContent === "string") {
-    reply = rawContent;
-  } else if (Array.isArray(rawContent)) {
-    reply = rawContent
+function extractReplyText(message: any): string {
+  const rawContent = message?.content.replace("*","");
+  if (typeof rawContent === "string") return rawContent;
+  if (Array.isArray(rawContent)) {
+    return rawContent
       .filter((part: { type?: string; text?: string }) => part?.type === "text")
       .map((part: { text?: string }) => part?.text ?? "")
       .join("");
-  } else {
-    reply = "Sorry, I couldn't generate a response.";
+  }
+  return "";
+}
+
+async function ask(userText: string): Promise<string> {
+  conversation.push({ role: "user", content: userText });
+
+  // First pass: let the model itself decide whether it needs to search.
+  // Most turns don't, so this is normally the ONLY Cerebras request per
+  // turn — search is opt-in per-message now instead of running every time.
+  let res: any = await client.chat.completions.create({
+    model: 'gpt-oss-120b',
+    messages: conversation as any,
+    tools: [SEARCH_TOOL_DEFINITION],
+    tool_choice: "auto",
+    parallel_tool_calls: false,
+  });
+
+  let message = res.choices[0]?.message;
+
+  if (message?.tool_calls?.length) {
+    const toolCall = message.tool_calls[0];
+    let query = userText;
+    try {
+      query = JSON.parse(toolCall.function.arguments)?.query || userText;
+    } catch {
+      // Malformed arguments — fall back to the raw user message as the query.
+    }
+
+    console.log("[search_web]", query);
+    const searchResult = await searchTheWeb(query);
+    const context =
+      typeof searchResult === "string" ? "" : buildWebContext(searchResult);
+    console.log(context);
+
+    // Record the tool call and its result in history, so the model (and
+    // later turns) can see what was already searched and doesn't repeat it.
+    conversation.push({
+      role: "assistant",
+      content: message.content ?? "",
+      tool_calls: message.tool_calls,
+    });
+    conversation.push({
+      role: "tool",
+      tool_call_id: toolCall.id,
+      content: context || "No relevant results were found.",
+    });
+
+    // Second pass: hand the model the search results and get its actual
+    // answer. Only happens on turns where it chose to search — a plain
+    // conversational turn never reaches this second request at all.
+    res = await client.chat.completions.create({
+      model: 'gpt-oss-120b',
+      messages: conversation as any,
+    });
+    message = res.choices[0]?.message;
   }
 
+  let reply = extractReplyText(message);
   if (!reply.trim()) {
     reply = "Sorry, I couldn't generate a response.";
   }
@@ -496,7 +673,7 @@ export function useVoiceAssistant() {
   }, [addEntry]);
 
   const toggleListening = useCallback(async () => {
-    if (phase !== "idle") return; // ignore taps while thinking/speaking
+    if (phase !== "idle") return; 
     setErrorMessage("");
     try {
       if (isListening) {
