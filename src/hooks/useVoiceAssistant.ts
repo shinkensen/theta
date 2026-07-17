@@ -254,6 +254,11 @@ function escapeSsml(text: string): string {
     .replace(/>/g, "&gt;");
 }
 
+// Set while an Edge TTS websocket is open, so interruptSpeech() (below) can
+// close it from outside synthesizeEdgeTTS if the user stops playback while
+// audio is still being synthesized (before any of it has started playing).
+let activeEdgeWs: WebSocket | null = null;
+
 // Talks to Microsoft's TTS websocket and resolves with a playable audio Blob
 // (mp3) once the full utterance has streamed back.
 async function synthesizeEdgeTTS(text: string): Promise<Blob> {
@@ -268,6 +273,7 @@ async function synthesizeEdgeTTS(text: string): Promise<Blob> {
   return new Promise<Blob>((resolve, reject) => {
     const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
+    activeEdgeWs = ws;
 
     const audioChunks: Uint8Array[] = [];
     let settled = false;
@@ -283,6 +289,7 @@ async function synthesizeEdgeTTS(text: string): Promise<Blob> {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      if (activeEdgeWs === ws) activeEdgeWs = null;
       ws.close();
       if (audioChunks.length === 0) {
         reject(new Error("Edge TTS returned no audio"));
@@ -295,6 +302,7 @@ async function synthesizeEdgeTTS(text: string): Promise<Blob> {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      if (activeEdgeWs === ws) activeEdgeWs = null;
       try {
         ws.close();
       } catch {
@@ -331,7 +339,7 @@ async function synthesizeEdgeTTS(text: string): Promise<Blob> {
       const ssml =
         `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>` +
         `<voice name='${EDGE_TTS_VOICE}'>` +
-        `<prosody pitch='+0Hz' rate='+40%' volume='+0%'>${escapeSsml(text)}</prosody>` +
+        `<prosody pitch='+0Hz' rate='+0%' volume='+0%'>${escapeSsml(text)}</prosody>` +
         `</voice></speak>`;
       ws.send(
         `X-RequestId:${requestId}\r\n` +
@@ -375,6 +383,18 @@ async function synthesizeEdgeTTS(text: string): Promise<Blob> {
 // Module-scoped audio element reused across calls so we don't leak elements.
 let ttsAudio: HTMLAudioElement | null = null;
 
+// True while the person has asked to stop mid-utterance — checked after
+// each await in speak() so a stop doesn't cause a fallback voice to pick
+// up where Edge TTS left off.
+let stopRequested = false;
+
+// Set only while audio is actively playing (i.e. once we're inside the
+// `new Promise` in speakEdgeTTS below). interruptSpeech() calls this to
+// resolve that promise immediately — just pausing the <audio> element
+// wouldn't fire 'ended' or 'error', so the awaiting promise would otherwise
+// hang forever instead of letting the rest of the ask() flow finish.
+let stopActivePlayback: (() => void) | null = null;
+
 async function speakEdgeTTS(text: string): Promise<void> {
   if (!ttsAudio) {
     ttsAudio = new Audio();
@@ -382,6 +402,8 @@ async function speakEdgeTTS(text: string): Promise<void> {
   ttsAudio.pause();
 
   const blob = await synthesizeEdgeTTS(text);
+  if (stopRequested) return; // stopped while synthesizing, before playback ever started
+
   const blobUrl = URL.createObjectURL(blob);
 
   await new Promise<void>((resolve, reject) => {
@@ -396,6 +418,12 @@ async function speakEdgeTTS(text: string): Promise<void> {
         ttsAudio.onended = null;
         ttsAudio.onerror = null;
       }
+      stopActivePlayback = null;
+    };
+    stopActivePlayback = () => {
+      ttsAudio?.pause();
+      cleanup();
+      resolve(); // an intentional stop is a normal completion, not an error
     };
     ttsAudio.onended = () => {
       cleanup();
@@ -467,13 +495,46 @@ async function speakWebFallback(text: string): Promise<void> {
 }
 
 async function speak(text: string): Promise<void> {
+  stopRequested = false;
   try {
     await speakEdgeTTS(text);
     return;
   } catch (error) {
+    if (stopRequested) return; // interrupted mid-synthesis — not a real failure
     console.error("[tts] Edge TTS failed, falling back to web speech:", error);
   }
+  if (stopRequested) return;
   await speakWebFallback(text);
+}
+
+// Stops whatever speech is currently in flight, however far along it is:
+// - mid-synthesis (Edge TTS websocket still streaming, nothing playing yet)
+// - mid-playback (Edge TTS audio already playing)
+// - the Web Speech fallback utterance
+// In every case the corresponding `speak()` call resolves normally rather
+// than throwing, so the ask()/speak() flow in the hook below finishes
+// cleanly and the assistant is immediately ready for the next turn.
+function interruptSpeech(): void {
+  stopRequested = true;
+
+  if (activeEdgeWs) {
+    try {
+      activeEdgeWs.close();
+    } catch {
+      // already closing/closed
+    }
+    activeEdgeWs = null;
+  }
+
+  if (stopActivePlayback) {
+    stopActivePlayback();
+  } else if (ttsAudio) {
+    ttsAudio.pause();
+  }
+
+  if (window.speechSynthesis) {
+    window.speechSynthesis.cancel();
+  }
 }
 
 // Given to the model as a callable tool rather than running automatically
@@ -505,7 +566,7 @@ const SEARCH_TOOL_DEFINITION = {
 };
 
 function extractReplyText(message: any): string {
-  const rawContent = message?.content.replace("*","");
+  const rawContent = message?.content;
   if (typeof rawContent === "string") return rawContent;
   if (Array.isArray(rawContent)) {
     return rawContent
@@ -531,6 +592,7 @@ async function ask(userText: string): Promise<string> {
   });
 
   let message = res.choices[0]?.message;
+  
 
   if (message?.tool_calls?.length) {
     const toolCall = message.tool_calls[0];
@@ -571,6 +633,7 @@ async function ask(userText: string): Promise<string> {
   }
 
   let reply = extractReplyText(message);
+  reply = reply.replace(/\*/g, "");
   if (!reply.trim()) {
     reply = "Sorry, I couldn't generate a response.";
   }
@@ -673,7 +736,7 @@ export function useVoiceAssistant() {
   }, [addEntry]);
 
   const toggleListening = useCallback(async () => {
-    if (phase !== "idle") return; 
+    if (phase !== "idle") return; // ignore taps while thinking/speaking
     setErrorMessage("");
     try {
       if (isListening) {
@@ -691,6 +754,13 @@ export function useVoiceAssistant() {
     }
   }, [isListening, phase]);
 
+  // Lets the UI put up a "stop talking" button. Only meaningful while
+  // phase === "speaking", but it's harmless to call otherwise — with
+  // nothing actively playing, interruptSpeech() is a no-op.
+  const stopSpeaking = useCallback(() => {
+    interruptSpeech();
+  }, []);
+
   const status: AssistantStatus = errorMessage
     ? "error"
     : phase !== "idle"
@@ -699,5 +769,13 @@ export function useVoiceAssistant() {
         ? "listening"
         : "standby";
 
-  return { status, partial, transcript, errorMessage, toggleListening, debugLogs };
+  return {
+    status,
+    partial,
+    transcript,
+    errorMessage,
+    toggleListening,
+    stopSpeaking,
+    debugLogs,
+  };
 }
