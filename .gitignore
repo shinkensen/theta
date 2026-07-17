@@ -24,3 +24,5 @@ dist-ssr
 *.sw?
 .env
 ./src/components/Recording.tsx
+
+./src/hooks/test.ts
