@@ -2,30 +2,55 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import Cerebras from '@cerebras/cerebras_cloud_sdk';
-import {Firecrawl} from 'firecrawl'
 
 // Web search is OPTIONAL context for the model. If the search API is
 // unconfigured (no key) or unreachable, we fall back to answering without
 // it rather than killing the whole voice loop. Note: this runs in the
 // webview, so we read the key from `import.meta.env` (Vite) — `process.env`
 // does not exist in the browser.
-const app = new Firecrawl({ apiKey:  import.meta.env.VITE_FIRECRAWL_KEY });
+//
+// We call Firecrawl's REST API directly with fetch rather than using the
+// `firecrawl` npm package: that SDK is written for Node and imports Node's
+// `events` module (EventEmitter) internally. Vite can't polyfill that for a
+// browser/webview build — it externalizes the module to a stub, and the SDK
+// crashes at import time trying to `extends EventEmitter` against it
+// ("Class extends value undefined is not a constructor or null"). Plain
+// fetch avoids the problem entirely since the REST API is just JSON over
+// HTTPS.
+const FIRECRAWL_API_KEY = import.meta.env.VITE_FIRECRAWL_KEY;
 
-
-async function searchTheWeb(query:string, limit = 3) {
+async function searchTheWeb(query: string, limit = 1) {
   try {
-    const results = await app.search(query, {
-      limit: limit,
-      scrapeOptions: {
-        formats: ['markdown']
-      }
+    const res = await fetch("https://api.firecrawl.dev/v1/search", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${FIRECRAWL_API_KEY}`,
+      },
+      body: JSON.stringify({
+        query,
+        limit,
+        scrapeOptions: {
+          formats: ["markdown"],
+        },
+      }),
     });
-    return results;
+
+    if (!res.ok) {
+      throw new Error(`Firecrawl search returned ${res.status}`);
+    }
+
+    const json = await res.json();
+    if (!json.success) {
+      throw new Error(json.error ?? "Firecrawl search failed");
+    }
+    return json.data;
   } catch (error) {
-    console.error('Search failed:', error);
-    return `Error during search: ${error.message}`;
+    console.error("Search failed:", error);
+    return `Error during search: ${error}`;
   }
 }
+
 const client = new Cerebras({
   apiKey: import.meta.env.VITE_CEREBRAS_API_KEY,
   dangerouslyAllowBrowser: true,
@@ -339,14 +364,21 @@ async function speak(text: string): Promise<void> {
 
 async function ask(userText: string): Promise<string> {
   // Search is best-effort context; never let it abort the conversation.
-  let context = ""
+  const context = await searchTheWeb(userText);
   const userContent = userText;
   conversation.push({ role: "user", content: userContent });
+  const tempMessages = [
+    ...conversation.slice(0, -1), // all previous messages except the last user message
+    {
+      role: "system",
+      content: `Here is relevant web context to help answer the user's next message: ${JSON.stringify(context)}`,
+    },
+    conversation[conversation.length - 1], // the user's actual message, last
+  ];
   const res: any = await client.chat.completions.create({
     model: 'gpt-oss-120b',
-    messages: conversation
+    messages: tempMessages as any,
   });
-  ;
 
   // content can be string | Array<...> | null — extract plain text safely
   const rawContent = res.choices[0]?.message?.content;
