@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import Cerebras from '@cerebras/cerebras_cloud_sdk';
-
+import { OpenRouter } from "@openrouter/sdk";
 // Web search is OPTIONAL context for the model. If the search API is
 // unconfigured (no key) or unreachable, we fall back to answering without
 // it rather than killing the whole voice loop. Note: this runs in the
@@ -19,7 +19,9 @@ import Cerebras from '@cerebras/cerebras_cloud_sdk';
 // HTTPS.
 const FIRECRAWL_API_KEY = import.meta.env.VITE_FIRECRAWL_KEY;
 const NUM_RESULTS_WEB = 3;
-
+const openrouter = new OpenRouter({
+  apiKey: import.meta.env.VITE_OPENROUTER_API_KEY
+});
 interface FirecrawlSearchResult {
   url: string;
   title?: string;
@@ -577,6 +579,22 @@ function extractReplyText(message: any): string {
   return "";
 }
 
+
+async function summarize(context:string,query:string){
+const res = await openrouter.chat.send({
+  chatRequest: {
+      model: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+      messages: [
+        {
+          role: "user",
+          content: "Summarize these Web Results to make them the most useful. Query : " + query + ". Web Results: " + context
+        }
+      ],
+      stream: false
+    }
+  });
+  return res.choices[0]?.message?.content ?? context 
+}
 async function ask(userText: string): Promise<string> {
   conversation.push({ role: "user", content: userText });
 
@@ -592,8 +610,6 @@ async function ask(userText: string): Promise<string> {
   });
 
   let message = res.choices[0]?.message;
-  
-
   if (message?.tool_calls?.length) {
     const toolCall = message.tool_calls[0];
     let query = userText;
@@ -605,10 +621,10 @@ async function ask(userText: string): Promise<string> {
 
     console.log("[search_web]", query);
     const searchResult = await searchTheWeb(query);
-    const context =
+    let context =
       typeof searchResult === "string" ? "" : buildWebContext(searchResult);
+    context = await summarize(context,userText)
     console.log(context);
-
     // Record the tool call and its result in history, so the model (and
     // later turns) can see what was already searched and doesn't repeat it.
     conversation.push({
