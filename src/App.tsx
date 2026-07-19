@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import { useVoiceAssistant, type AssistantStatus } from "./hooks/useVoiceAssistant";
 import "./App.css";
-
+import {register,unregister} from '@tauri-apps/plugin-global-shortcut';
 const STATUS_COPY: Record<AssistantStatus, string> = {
   standby: "STANDBY",
   listening: "LISTENING",
@@ -79,6 +79,21 @@ function App() {
   const logEndRef = useRef<HTMLDivElement>(null);
   const debugEndRef = useRef<HTMLDivElement>(null);
 
+  useEffect(()=>{
+    async function t(){
+      await register('CommandOrControl+E',async(event)=>{if (event.state == 'Pressed'){
+        await toggleListening();
+      }})
+    }
+    t();
+
+    return () => {
+    async function teardownShortcut() {
+      await unregister('CommandOrControl+E');
+    }
+    teardownShortcut();
+  };
+  },[])
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [transcript, partial]);

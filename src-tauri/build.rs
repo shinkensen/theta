@@ -11,8 +11,7 @@ fn main() {
     // `cargo run` / `tauri dev` can load them.
     #[cfg(target_os = "windows")]
     {
-        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-            .expect("CARGO_MANIFEST_DIR not set");
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
         let vosk_dir = std::path::Path::new(&manifest_dir)
             .join("vosk")
             .join("vosk-win64-0.3.45");
@@ -28,10 +27,7 @@ fn main() {
             );
         }
 
-        println!(
-            "cargo:rustc-link-search=native={}",
-            vosk_dir.display()
-        );
+        println!("cargo:rustc-link-search=native={}", vosk_dir.display());
 
         // Copy the runtime DLLs next to the built artifact so they load at
         // runtime. `OUT_DIR` is `<target>/<profile>/build/<crate>-<hash>/out`,

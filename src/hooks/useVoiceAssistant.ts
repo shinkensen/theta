@@ -3,20 +3,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import Cerebras from '@cerebras/cerebras_cloud_sdk';
 import { OpenRouter } from "@openrouter/sdk";
-// Web search is OPTIONAL context for the model. If the search API is
-// unconfigured (no key) or unreachable, we fall back to answering without
-// it rather than killing the whole voice loop. Note: this runs in the
-// webview, so we read the key from `import.meta.env` (Vite) — `process.env`
-// does not exist in the browser.
-//
-// We call Firecrawl's REST API directly with fetch rather than using the
-// `firecrawl` npm package: that SDK is written for Node and imports Node's
-// `events` module (EventEmitter) internally. Vite can't polyfill that for a
-// browser/webview build — it externalizes the module to a stub, and the SDK
-// crashes at import time trying to `extends EventEmitter` against it
-// ("Class extends value undefined is not a constructor or null"). Plain
-// fetch avoids the problem entirely since the REST API is just JSON over
-// HTTPS.
 const FIRECRAWL_API_KEY = import.meta.env.VITE_FIRECRAWL_KEY;
 const NUM_RESULTS_WEB = 3;
 const openrouter = new OpenRouter({
@@ -28,12 +14,6 @@ interface FirecrawlSearchResult {
   description?: string;
   markdown?: string;
 }
-
-// These sites tend to scrape into enormous, noisy markdown (embedded
-// JSON, related-content blocks, tracking data) that regularly blows past
-// what a single summarization request will accept — and even when it
-// doesn't, the content itself (video/audio pages) isn't usefully
-// summarizable as text anyway. Simplest fix: don't scrape them at all.
 const BLOCKED_RESULT_DOMAINS = [
   "youtube.com",
   "youtu.be",
@@ -51,21 +31,11 @@ function isBlockedDomain(url: string): boolean {
     return false;
   }
 }
-
-// `scrapeOptions.formats: ["markdown"]` here means Firecrawl already scrapes
-// the *full* page for every result, not just a snippet — each result's
-// `markdown` field is the whole page. (If it looked truncated in devtools,
-// that's just the console collapsing long strings for display; the full
-// text is there.) `onlyMainContent` strips nav/header/footer boilerplate
-// before it even gets to us.
 async function searchTheWeb(
   query: string,
   limit = NUM_RESULTS_WEB,
 ): Promise<FirecrawlSearchResult[] | string> {
   try {
-    // Over-fetch a bit since some results get filtered out afterward —
-    // otherwise a query that happens to surface a YouTube/Spotify link
-    // would silently return fewer usable results than requested.
     const fetchLimit = limit + 3;
     const res = await fetch("https://api.firecrawl.dev/v1/search", {
       method: "POST",
@@ -103,39 +73,12 @@ const client = new Cerebras({
   apiKey: import.meta.env.VITE_CEREBRAS_API_KEY,
   dangerouslyAllowBrowser: true,
 });
-
-// Pages like YouTube/Spotify often scrape down to markdown that's mostly
-// embedded JSON, related-content lists, and other non-visible cruft — easily
-// hundreds of KB. Truncating up front keeps the combined context small; the
-// answer we actually need is almost always near the top of the page anyway.
-//
-// NOTE: this used to run each page through its own Cerebras summarization
-// call before folding the result into the main conversation call — up to
-// 4 Cerebras requests per turn (3 pages + 1 answer). Cerebras' rate limit
-// is a shared tokens-per-minute budget across *all* requests, so that
-// pattern burned through it fast and 429'd constantly. Now there's no
-// separate summarization step at all: the truncated raw markdown for every
-// page is concatenated directly into the system message of the single main
-// call, so there's exactly one Cerebras request per turn regardless of how
-// many pages were scraped.
-//
-// Bumped from 4000 -> 9000: long-form articles (best-of listicles,
-// comparison posts) often carry a big table of contents / intro before the
-// actual useful content (e.g. a comparison table) even starts. At 4000
-// chars, that useful part was regularly getting cut off entirely — the
-// "[...truncated...]" marker was landing right before the content that
-// actually mattered. There's headroom for this since it's one combined
-// request instead of one per page now.
 const MAX_PAGE_MARKDOWN_CHARS = 9000;
 
 function truncateMarkdown(markdown: string): string {
   if (markdown.length <= MAX_PAGE_MARKDOWN_CHARS) return markdown;
   return markdown.slice(0, MAX_PAGE_MARKDOWN_CHARS) + "\n\n[...truncated...]";
 }
-
-// No LLM call here — just formats and truncates. Kept as its own function
-// so it's easy to swap back to per-page or batch summarization later if
-// rate limits ever stop being the binding constraint.
 function buildWebContext(results: FirecrawlSearchResult[]): string {
   const pages = results.filter((r) => r.markdown);
   if (pages.length === 0) return "";
@@ -158,18 +101,6 @@ export interface TranscriptEntry {
   text: string;
   timestamp: number;
 }
-
-// Module-level so it survives re-renders without extra state plumbing.
-// Broadened beyond plain {role, content} to also carry tool_calls (on
-// assistant messages that invoke search_web) and tool_call_id (on the
-// resulting tool-role messages) — see the tool-calling flow in ask().
-//
-// FIX: this used to be `new Date().getDate().toString()`, which is only
-// the day-of-month integer (e.g. "17") — no month, no year. The model had
-// no way to know it was actually mid-2026, so left to its own devices it
-// defaulted to its training-era assumption and searched for "2024" instead
-// of the current year. Using a full formatted date (with year) fixes that
-// at the source.
 const now = new Date();
 const currentDateString = now.toLocaleDateString("en-US", {
   weekday: "long",
@@ -186,7 +117,7 @@ let conversation: Array<{
     {
       role: "system",
       content:
-        `You are a helpful voice assistant. Today's date is ${currentDateString}. Trust this date over ` +
+        `You are a helpful voice assistant Keep responses brief. Today's date is ${currentDateString}. Trust this date over ` +
         "whatever year you'd otherwise assume — your training data has a cutoff well before today, so don't " +
         "default to an old year when forming search queries or answering questions about what's current. " +
         "DO NOT INCLUDE FORMATTING. Keep replies short and conversational — they will be read aloud. " +
@@ -196,26 +127,6 @@ let conversation: Array<{
         "or something already searched earlier in this conversation.",
     },
   ];
-
-// ---------------------------------------------------------------------------
-// Edge TTS — free, no API key, uses the same neural voices as Microsoft
-// Edge's "Read Aloud" feature (Azure Cognitive Services voices under the
-// hood). Noticeably more natural than StreamElements' Polly voices and the
-// built-in Web Speech voices. This talks directly to Microsoft's
-// synthesize-readaloud websocket endpoint from the browser — no server
-// component needed.
-//
-// Caveat: this is a reverse-engineered, undocumented endpoint (the same one
-// the `edge-tts` Python/Node libraries use). Microsoft can change auth
-// requirements or rate-limit it without notice, which is why we still keep
-// the Web Speech fallback below as a last resort.
-//
-// Pick any voice from `edge-tts --list-voices` (or the list at
-// https://github.com/rany2/edge-tts). A few good ones:
-//   en-GB-RyanNeural   — warm British male (used below)
-//   en-US-AndrewNeural — warm US male
-//   en-US-AvaNeural    — natural US female
-//   en-GB-SoniaNeural  — natural British female
 const EDGE_TTS_VOICE = "en-GB-RyanNeural";
 
 const EDGE_TRUSTED_CLIENT_TOKEN = import.meta.env.VITE_EDGE_TRUSTED_TOKEN;
@@ -224,19 +135,13 @@ const EDGE_WS_BASE =
 const EDGE_CHROMIUM_VERSION = "130.0.2849.68";
 
 function newGuid(): string {
-  // crypto.randomUUID() is available in Tauri webviews; strip dashes since
-  // Edge's protocol expects the connection/request IDs bare.
   return crypto.randomUUID().replace(/-/g, "");
 }
-
-// Microsoft gates the endpoint behind a `Sec-MS-GEC` token: SHA-256 of
-// "<windows-file-time-rounded-to-5min><trusted client token>", uppercased.
-// Ported from the algorithm used by the edge-tts Python/Node libraries.
 async function computeSecMsGec(): Promise<string> {
-  const WIN_EPOCH_SECONDS = 11644473600n; // seconds between 1601-01-01 and 1970-01-01
+  const WIN_EPOCH_SECONDS = 11644473600n;
   let seconds = BigInt(Math.floor(Date.now() / 1000)) + WIN_EPOCH_SECONDS;
-  seconds -= seconds % 300n; // round down to a 5-minute window
-  const windowsTicks = seconds * 10_000_000n; // seconds -> 100ns ticks
+  seconds -= seconds % 300n; 
+  const windowsTicks = seconds * 10_000_000n; 
 
   const toHash = `${windowsTicks.toString()}${EDGE_TRUSTED_CLIENT_TOKEN}`;
   const digest = await crypto.subtle.digest(
@@ -255,14 +160,7 @@ function escapeSsml(text: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 }
-
-// Set while an Edge TTS websocket is open, so interruptSpeech() (below) can
-// close it from outside synthesizeEdgeTTS if the user stops playback while
-// audio is still being synthesized (before any of it has started playing).
 let activeEdgeWs: WebSocket | null = null;
-
-// Talks to Microsoft's TTS websocket and resolves with a playable audio Blob
-// (mp3) once the full utterance has streamed back.
 async function synthesizeEdgeTTS(text: string): Promise<Blob> {
   const secMsGec = await computeSecMsGec();
   const connectionId = newGuid();
@@ -308,15 +206,12 @@ async function synthesizeEdgeTTS(text: string): Promise<Blob> {
       try {
         ws.close();
       } catch {
-        // already closing/closed
       }
       reject(err instanceof Error ? err : new Error(String(err)));
     };
 
     ws.onopen = () => {
       const timestamp = new Date().toUTCString();
-
-      // 1. Speech config — request mp3 output so it's easy to play back.
       ws.send(
         `X-Timestamp:${timestamp}\r\n` +
           `Content-Type:application/json; charset=utf-8\r\n` +
@@ -335,8 +230,6 @@ async function synthesizeEdgeTTS(text: string): Promise<Blob> {
             },
           }),
       );
-
-      // 2. SSML request with the actual text to speak.
       const requestId = newGuid();
       const ssml =
         `<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='en-US'>` +
@@ -356,12 +249,8 @@ async function synthesizeEdgeTTS(text: string): Promise<Blob> {
         if (event.data.includes("Path:turn.end")) {
           finish();
         }
-        // "Path:turn.start" / "Path:response" / audio.metadata frames are
-        // informational only — nothing else to do with them here.
         return;
       }
-
-      // Binary frame: [2-byte big-endian header length][header text][audio bytes]
       const buffer = event.data as ArrayBuffer;
       if (buffer.byteLength < 2) return;
       const view = new DataView(buffer);
@@ -381,20 +270,10 @@ async function synthesizeEdgeTTS(text: string): Promise<Blob> {
     };
   });
 }
-
-// Module-scoped audio element reused across calls so we don't leak elements.
 let ttsAudio: HTMLAudioElement | null = null;
 
-// True while the person has asked to stop mid-utterance — checked after
-// each await in speak() so a stop doesn't cause a fallback voice to pick
-// up where Edge TTS left off.
 let stopRequested = false;
 
-// Set only while audio is actively playing (i.e. once we're inside the
-// `new Promise` in speakEdgeTTS below). interruptSpeech() calls this to
-// resolve that promise immediately — just pausing the <audio> element
-// wouldn't fire 'ended' or 'error', so the awaiting promise would otherwise
-// hang forever instead of letting the rest of the ask() flow finish.
 let stopActivePlayback: (() => void) | null = null;
 
 async function speakEdgeTTS(text: string): Promise<void> {
@@ -404,7 +283,7 @@ async function speakEdgeTTS(text: string): Promise<void> {
   ttsAudio.pause();
 
   const blob = await synthesizeEdgeTTS(text);
-  if (stopRequested) return; // stopped while synthesizing, before playback ever started
+  if (stopRequested) return;
 
   const blobUrl = URL.createObjectURL(blob);
 
@@ -425,7 +304,7 @@ async function speakEdgeTTS(text: string): Promise<void> {
     stopActivePlayback = () => {
       ttsAudio?.pause();
       cleanup();
-      resolve(); // an intentional stop is a normal completion, not an error
+      resolve(); 
     };
     ttsAudio.onended = () => {
       cleanup();
@@ -442,11 +321,6 @@ async function speakEdgeTTS(text: string): Promise<void> {
     });
   });
 }
-
-// Chromium-based webviews (which Tauri uses on Windows/Linux) populate the
-// voice list asynchronously — on first call `getVoices()` often returns []
-// and the utterance gets silently dropped rather than throwing. This waits
-// for the `voiceschanged` event (with a timeout fallback) before speaking.
 function getVoicesAsync(): Promise<SpeechSynthesisVoice[]> {
   return new Promise((resolve) => {
     const existing = window.speechSynthesis.getVoices();
@@ -465,9 +339,6 @@ function getVoicesAsync(): Promise<SpeechSynthesisVoice[]> {
     };
   });
 }
-
-// Last-resort fallback using the built-in (robotic) Web Speech API voices,
-// used only if Edge TTS is unreachable or blocked.
 async function speakWebFallback(text: string): Promise<void> {
   if (!window.speechSynthesis) {
     console.warn("Speech synthesis not supported in this environment");
@@ -502,20 +373,12 @@ async function speak(text: string): Promise<void> {
     await speakEdgeTTS(text);
     return;
   } catch (error) {
-    if (stopRequested) return; // interrupted mid-synthesis — not a real failure
+    if (stopRequested) return;
     console.error("[tts] Edge TTS failed, falling back to web speech:", error);
   }
   if (stopRequested) return;
   await speakWebFallback(text);
 }
-
-// Stops whatever speech is currently in flight, however far along it is:
-// - mid-synthesis (Edge TTS websocket still streaming, nothing playing yet)
-// - mid-playback (Edge TTS audio already playing)
-// - the Web Speech fallback utterance
-// In every case the corresponding `speak()` call resolves normally rather
-// than throwing, so the ask()/speak() flow in the hook below finishes
-// cleanly and the assistant is immediately ready for the next turn.
 function interruptSpeech(): void {
   stopRequested = true;
 
@@ -538,13 +401,6 @@ function interruptSpeech(): void {
     window.speechSynthesis.cancel();
   }
 }
-
-// Given to the model as a callable tool rather than running automatically
-// on every turn. Cerebras' gpt-oss-120b supports OpenAI-style tool calling,
-// so the model itself decides — based on the conversation so far — whether
-// a given question actually needs a web search, and skips it for anything
-// it can already answer (chit-chat, follow-ups, things already searched
-// earlier in the same conversation).
 const SEARCH_TOOL_DEFINITION = {
   type: "function",
   function: {
@@ -597,10 +453,6 @@ const res = await openrouter.chat.send({
 }
 async function ask(userText: string): Promise<string> {
   conversation.push({ role: "user", content: userText });
-
-  // First pass: let the model itself decide whether it needs to search.
-  // Most turns don't, so this is normally the ONLY Cerebras request per
-  // turn — search is opt-in per-message now instead of running every time.
   let res: any = await client.chat.completions.create({
     model: 'gpt-oss-120b',
     messages: conversation as any,
@@ -724,7 +576,7 @@ export function useVoiceAssistant() {
       const d = await listen<string>("theta-debug", (event) => {
         setDebugLogs((prev) => {
           const next = [...prev, event.payload];
-          if (next.length > 50) return next.slice(next.length - 50); // Keep last 50 logs
+          if (next.length > 50) return next.slice(next.length - 50);
           return next;
         });
       });
@@ -750,9 +602,8 @@ export function useVoiceAssistant() {
       unlistenDebug?.();
     };
   }, [addEntry]);
-
   const toggleListening = useCallback(async () => {
-    if (phase !== "idle") return; // ignore taps while thinking/speaking
+    if (phase !== "idle") return; 
     setErrorMessage("");
     try {
       if (isListening) {

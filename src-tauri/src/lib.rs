@@ -34,8 +34,10 @@ impl ListeningState {
     pub fn new(model_path: &str) -> Self {
         eprintln!("[theta] Loading Vosk model from {model_path}");
         let model = Model::new(model_path).unwrap_or_else(|| {
-            panic!("[theta] Failed to load Vosk model from '{model_path}'. \
-                Ensure the model directory exists and is a valid Vosk model.")
+            panic!(
+                "[theta] Failed to load Vosk model from '{model_path}'. \
+                Ensure the model directory exists and is a valid Vosk model."
+            )
         });
         eprintln!("[theta] Vosk model loaded successfully");
         Self {
@@ -129,9 +131,7 @@ fn run_listening_loop(
     last_partial: Arc<Mutex<String>>,
 ) -> Result<(), String> {
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or("No input device found")?;
+    let device = host.default_input_device().ok_or("No input device found")?;
     let supported_config = device
         .default_input_config()
         .map_err(|e| format!("Failed to get input config: {e}"))?;
@@ -158,8 +158,7 @@ fn run_listening_loop(
     // Vosk requires 16 kHz mono i16 audio.
     // We always feed the recognizer at 16000 Hz regardless of device rate.
     const VOSK_RATE: f32 = 16000.0;
-    let mut recognizer =
-        Recognizer::new(&model, VOSK_RATE).ok_or("Failed to create recognizer")?;
+    let mut recognizer = Recognizer::new(&model, VOSK_RATE).ok_or("Failed to create recognizer")?;
     recognizer.set_words(true);
 
     // Shared recognizer behind a mutex so the stream callback (which may run
@@ -190,16 +189,32 @@ fn run_listening_loop(
                         .map(|ch| ch.iter().sum::<f32>() / device_channels as f32)
                         .collect()
                 };
-                let resampled = resample_f32(&mono, device_sample_rate, VOSK_RATE as u32, &resample_acc_stream);
+                let resampled = resample_f32(
+                    &mono,
+                    device_sample_rate,
+                    VOSK_RATE as u32,
+                    &resample_acc_stream,
+                );
                 let tick = level_tick_stream.fetch_add(1, Ordering::Relaxed);
                 if tick % 10 == 0 {
-                    let rms = (resampled.iter().map(|s| (*s as f32) * (*s as f32)).sum::<f32>()
+                    let rms = (resampled
+                        .iter()
+                        .map(|s| (*s as f32) * (*s as f32))
+                        .sum::<f32>()
                         / resampled.len().max(1) as f32)
                         .sqrt();
-                    let _ = app_for_stream.emit("theta-level", (rms / i16::MAX as f32 * 1000.0).round() as i32);
+                    let _ = app_for_stream.emit(
+                        "theta-level",
+                        (rms / i16::MAX as f32 * 1000.0).round() as i32,
+                    );
                 }
                 if let Ok(mut rec) = recognizer_stream.lock() {
-                    process_samples_i16(&mut rec, &resampled, &app_for_stream, &last_partial_for_stream);
+                    process_samples_i16(
+                        &mut rec,
+                        &resampled,
+                        &app_for_stream,
+                        &last_partial_for_stream,
+                    );
                 }
             },
             |err| eprintln!("Audio stream error: {err}"),
@@ -212,20 +227,37 @@ fn run_listening_loop(
                 let mono: Vec<f32> = if device_channels == 1 {
                     f32_data
                 } else {
-                    f32_data.chunks(device_channels)
+                    f32_data
+                        .chunks(device_channels)
                         .map(|ch| ch.iter().sum::<f32>() / device_channels as f32)
                         .collect()
                 };
-                let resampled = resample_f32(&mono, device_sample_rate, VOSK_RATE as u32, &resample_acc_stream);
+                let resampled = resample_f32(
+                    &mono,
+                    device_sample_rate,
+                    VOSK_RATE as u32,
+                    &resample_acc_stream,
+                );
                 let tick = level_tick_stream.fetch_add(1, Ordering::Relaxed);
                 if tick % 10 == 0 {
-                    let rms = (resampled.iter().map(|s| (*s as f32) * (*s as f32)).sum::<f32>()
+                    let rms = (resampled
+                        .iter()
+                        .map(|s| (*s as f32) * (*s as f32))
+                        .sum::<f32>()
                         / resampled.len().max(1) as f32)
                         .sqrt();
-                    let _ = app_for_stream.emit("theta-level", (rms / i16::MAX as f32 * 1000.0).round() as i32);
+                    let _ = app_for_stream.emit(
+                        "theta-level",
+                        (rms / i16::MAX as f32 * 1000.0).round() as i32,
+                    );
                 }
                 if let Ok(mut rec) = recognizer_stream.lock() {
-                    process_samples_i16(&mut rec, &resampled, &app_for_stream, &last_partial_for_stream);
+                    process_samples_i16(
+                        &mut rec,
+                        &resampled,
+                        &app_for_stream,
+                        &last_partial_for_stream,
+                    );
                 }
             },
             |err| eprintln!("Audio stream error: {err}"),
@@ -234,24 +266,44 @@ fn run_listening_loop(
         cpal::SampleFormat::U16 => device.build_input_stream(
             config,
             move |data: &[u16], _: &_| {
-                let f32_data: Vec<f32> = data.iter().map(|&s| (s as f32 - 32768.0) / 32768.0).collect();
+                let f32_data: Vec<f32> = data
+                    .iter()
+                    .map(|&s| (s as f32 - 32768.0) / 32768.0)
+                    .collect();
                 let mono: Vec<f32> = if device_channels == 1 {
                     f32_data
                 } else {
-                    f32_data.chunks(device_channels)
+                    f32_data
+                        .chunks(device_channels)
                         .map(|ch| ch.iter().sum::<f32>() / device_channels as f32)
                         .collect()
                 };
-                let resampled = resample_f32(&mono, device_sample_rate, VOSK_RATE as u32, &resample_acc_stream);
+                let resampled = resample_f32(
+                    &mono,
+                    device_sample_rate,
+                    VOSK_RATE as u32,
+                    &resample_acc_stream,
+                );
                 let tick = level_tick_stream.fetch_add(1, Ordering::Relaxed);
                 if tick % 10 == 0 {
-                    let rms = (resampled.iter().map(|s| (*s as f32) * (*s as f32)).sum::<f32>()
+                    let rms = (resampled
+                        .iter()
+                        .map(|s| (*s as f32) * (*s as f32))
+                        .sum::<f32>()
                         / resampled.len().max(1) as f32)
                         .sqrt();
-                    let _ = app_for_stream.emit("theta-level", (rms / i16::MAX as f32 * 1000.0).round() as i32);
+                    let _ = app_for_stream.emit(
+                        "theta-level",
+                        (rms / i16::MAX as f32 * 1000.0).round() as i32,
+                    );
                 }
                 if let Ok(mut rec) = recognizer_stream.lock() {
-                    process_samples_i16(&mut rec, &resampled, &app_for_stream, &last_partial_for_stream);
+                    process_samples_i16(
+                        &mut rec,
+                        &resampled,
+                        &app_for_stream,
+                        &last_partial_for_stream,
+                    );
                 }
             },
             |err| eprintln!("Audio stream error: {err}"),
@@ -347,10 +399,8 @@ fn process_samples_i16(
                 let text = result.text.to_string();
                 if !text.is_empty() {
                     let _ = app_handle.emit("vosk-speech-result", text.clone());
-                    let _ = app_handle.emit(
-                        "theta-debug",
-                        format!("[{}] FINAL: {text:?}", now_stamp()),
-                    );
+                    let _ = app_handle
+                        .emit("theta-debug", format!("[{}] FINAL: {text:?}", now_stamp()));
                     if let Ok(mut p) = last_partial.lock() {
                         p.clear();
                     }
@@ -508,6 +558,7 @@ pub fn run() {
     let model_path = resolve_vosk_model_path();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .manage(ListeningState::new(&model_path))
         .invoke_handler(tauri::generate_handler![

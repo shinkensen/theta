@@ -50,7 +50,7 @@ button {
   height: 100vh;
   display: grid;
   grid-template-rows: auto 1fr auto auto;
-  background: radial-gradient(ellipse at 50% -10%, #1b1f26 0%, var(--ink) 55%);
+  background: black;
 }
 
 /* ---------- status bar ---------- */
@@ -312,13 +312,10 @@ button {
   height: 30px;
 }
 
-/* standby: quiet, waiting */
 .dial--standby .dial__core:hover {
   color: var(--paper);
   border-color: var(--muted);
 }
-
-/* listening: amber ticks chase around the ring */
 .dial--listening .dial__tick {
   stroke: var(--signal-amber);
   animation: tick-chase 1.6s linear infinite;
@@ -368,10 +365,9 @@ button {
   }
 }
 
-/* speaking: teal pulse, like a level meter breathing */
 .dial--speaking .dial__tick {
   stroke: var(--scope-teal);
-  animation: breathe 1.4s ease-in-out infinite;
+  animation: breathe 0s ease-in-out infinite;
 }
 .dial--speaking .dial__core {
   color: var(--scope-teal);
