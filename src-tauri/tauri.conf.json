@@ -12,9 +12,16 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Theta",
-        "width": 1024,
-        "height": 700
+        "width": 1180,
+        "height": 760,
+        "minWidth": 880,
+        "minHeight": 560,
+        "decorations": false,
+        "transparent": false,
+        "center": true,
+        "resizable": true
       }
     ],
     "security": {

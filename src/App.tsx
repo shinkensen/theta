@@ -1,164 +1,95 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useVoiceAssistant, type AssistantStatus } from "./hooks/useVoiceAssistant";
+import type { AuthStatus, CalendarSummary, CalEvent, PortInfo, ProcessInfo, ProfileItem, RagDoc, Settings, SystemStats } from "./uiTypes";
 import "./App.css";
-import {register,unregister} from '@tauri-apps/plugin-global-shortcut';
-const STATUS_COPY: Record<AssistantStatus, string> = {
-  standby: "STANDBY",
-  listening: "LISTENING",
-  thinking: "THINKING",
-  speaking: "RESPONDING",
-  error: "SIGNAL LOST",
+
+type View = "chat" | "calendar" | "system" | "memory" | "settings" | "debug";
+type IconName = View | "send" | "mic" | "stop" | "refresh" | "spark" | "copy";
+const NAV: Array<[View, string]> = [["chat", "Chat"], ["calendar", "Calendar"], ["system", "System"], ["memory", "Memory"], ["settings", "Settings"], ["debug", "Debug"]];
+const STATUS: Record<AssistantStatus, string> = { standby: "Ready", listening: "Listening", thinking: "Thinking", speaking: "Speaking", error: "Needs attention" };
+const ICONS: Record<IconName, ReactNode> = {
+  chat: <><path d="M4 5.5h16v11H9l-5 3v-14Z"/><path d="M8 10h8M8 13h5"/></>,
+  calendar: <><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M8 3v4m8-4v4M4 9h16"/></>,
+  system: <><path d="M3 12h4l2.2-6 4 12 2.2-6H21"/></>,
+  memory: <><path d="M12 3a5 5 0 0 0-4.6 3A4 4 0 0 0 6 13.7V16a3 3 0 0 0 3 3h3V3Zm0 0a5 5 0 0 1 4.6 3A4 4 0 0 1 18 13.7V16a3 3 0 0 1-3 3h-3"/><path d="M8 9h4m-5 4h5m4-4h-4m5 4h-5"/></>,
+  settings: <><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H3v-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3V3h4v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></>,
+  send: <path d="m5 12 14-7-4 14-3-6-7-1Zm7 1 3-3"/>, mic: <><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0m-7 7v3"/></>,
+  stop: <rect x="7" y="7" width="10" height="10" rx="2"/>, refresh: <><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></>, spark: <path d="m12 3 1.6 5.4L19 10l-5.4 1.6L12 17l-1.6-5.4L5 10l5.4-1.6L12 3Z"/>,
+  debug: <><rect x="4" y="5" width="16" height="14" rx="2"/><path d="m8 10 2 2-2 2m4 0h4"/></>, copy: <><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></>
 };
+function Icon({ name, size = 20 }: { name: IconName; size?: number }) { return <svg className="icon" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{ICONS[name]}</svg>; }
+function VoicePresence({ status, level = 0 }: { status: AssistantStatus; level?: number }) { return <div className={`voice-presence ${status}`} style={{ "--level": level } as React.CSSProperties}><div className="voice-halo"/><div className="voice-core"><span>θ</span></div></div>; }
+function fmt(value: string): string { const date = new Date(value); return Number.isNaN(date.valueOf()) ? value : date.toLocaleString([], { dateStyle: "medium", timeStyle: "short" }); }
+function WindowChrome() { const win = getCurrentWindow(); return <header className="titlebar" data-tauri-drag-region><div className="brand" data-tauri-drag-region><span>θ</span><b>Theta</b></div><div className="window-actions"><button aria-label="Minimize window" onClick={() => void win.minimize()}>—</button><button aria-label="Maximize or restore window" onClick={() => void win.toggleMaximize()}>□</button><button className="close" aria-label="Close window" onClick={() => void win.close()}>×</button></div></header>; }
+function Panel({ title, subtitle, action, children }: { title: string; subtitle?: string; action?: ReactNode; children: ReactNode }) { return <section className="panel"><div className="panel-head"><div><h1>{title}</h1>{subtitle && <p>{subtitle}</p>}</div>{action}</div>{children}</section>; }
+function Empty({ children }: { children: ReactNode }) { return <div className="empty">{children}</div>; }
 
-const TICK_COUNT = 36;
-
-function Dial({
-  status,
-  onPress,
-}: {
-  status: AssistantStatus;
-  onPress: () => void;
-}) {
-  const ticks = Array.from({ length: TICK_COUNT }, (_, i) => i);
-
-  return (
-    <button
-      className={`dial dial--${status}`}
-      onClick={onPress}
-      aria-pressed={status === "listening"}
-      aria-label={
-        status === "listening" ? "Stop listening" : "Start listening"
-      }
-      disabled={status === "thinking" || status === "speaking"}
-    >
-      <svg className="dial__ring" viewBox="0 0 200 200" aria-hidden="true">
-        {ticks.map((i) => {
-          const angle = (i / TICK_COUNT) * 360;
-          return (
-            <line
-              key={i}
-              className="dial__tick"
-              style={{ animationDelay: `${(i / TICK_COUNT) * 1.6}s` }}
-              x1="100"
-              y1="14"
-              x2="100"
-              y2="26"
-              transform={`rotate(${angle} 100 100)`}
-            />
-          );
-        })}
-      </svg>
-      <span className="dial__core">
-        <svg viewBox="0 0 24 24" className="dial__mic" aria-hidden="true">
-          <rect x="9" y="2" width="6" height="12" rx="3" fill="currentColor" />
-          <path
-            d="M5 11a7 7 0 0 0 14 0"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.8"
-            strokeLinecap="round"
-          />
-          <line
-            x1="12"
-            y1="18"
-            x2="12"
-            y2="22"
-            stroke="currentColor"
-            strokeWidth="1.8"
-            strokeLinecap="round"
-          />
-        </svg>
-      </span>
-    </button>
-  );
+function ChatView({ assistant }: { assistant: ReturnType<typeof useVoiceAssistant> }) {
+  const [draft, setDraft] = useState(""); const end = useRef<HTMLDivElement>(null);
+  useEffect(() => { end.current?.scrollIntoView({ behavior: "smooth" }); }, [assistant.transcript, assistant.partial, assistant.activities, assistant.confirmation]);
+  const send = (event: FormEvent) => { event.preventDefault(); if (!draft.trim()) return; void assistant.submitText(draft); setDraft(""); };
+  const starters = ["What’s on my calendar today?", "How is my system doing?", "What do you remember about me?", "Research something for me"];
+  return <div className="chat-layout"><div className="chat-scroll">{assistant.transcript.length === 0 && <div className="chat-intro"><VoicePresence status={assistant.status} level={assistant.level} /><span className="eyebrow">YOUR DESKTOP, IN CONVERSATION</span><h1>What can I take care of?</h1><p>Speak naturally or type a request. Theta can work across your calendar, computer, memory and the web—with you in control.</p><div className="starter-grid">{starters.map((prompt) => <button key={prompt} onClick={() => void assistant.submitText(prompt)}><Icon name="spark" size={16}/><span>{prompt}</span></button>)}</div></div>}
+    {assistant.transcript.map((entry) => <article className={`message ${entry.role}`} key={entry.id}><div className="message-label">{entry.role === "user" ? "You" : "Theta"}<time>{new Date(entry.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time></div><div className="bubble">{entry.text}</div></article>) }
+    {assistant.partial && <article className="message user partial"><div className="message-label">Listening</div><div className="bubble">{assistant.partial}</div></article>}
+    {assistant.activities.map((item) => <div className={`tool-card ${item.status}`} key={item.id}><span className="tool-icon"><Icon name="spark" size={16}/></span><div><b>{item.name.replace(/_/g, " ")}</b><small>{item.message ?? item.status}</small></div><span className="tool-state">{item.status}</span></div>)}
+    {assistant.confirmation && <div className="confirm-card" role="alertdialog" aria-label="Confirm action"><span className="warning">!</span><div><b>Approval required</b><p>{assistant.confirmation.summary}</p><details><summary>Review details</summary><pre>{JSON.stringify(assistant.confirmation.args, null, 2)}</pre></details></div><div className="confirm-actions"><button onClick={assistant.deny}>Deny</button><button className="primary" onClick={assistant.approve}>Approve</button></div></div>}
+    <div ref={end} /></div>
+    <form className="composer" onSubmit={send}><button type="button" className={`mic ${assistant.isListening ? "active" : ""}`} aria-label={assistant.isListening ? "Stop listening" : "Start listening"} onClick={() => void assistant.toggleListening()}><span style={{ transform: `scale(${1 + assistant.level * .45})` }}><Icon name="mic" size={20}/></span></button><label className="sr-only" htmlFor="prompt">Message Theta</label><textarea id="prompt" value={draft} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} placeholder={assistant.isListening ? "I’m listening…" : "Ask Theta or give it a task…"} rows={1} /><div className="composer-actions"><span>{assistant.status === "speaking" && assistant.speechDiagnostic ? assistant.speechDiagnostic.detail : "Enter to send · Shift + Enter for a new line"}</span>{assistant.status === "thinking" || assistant.status === "speaking" ? <button className="stop-action" type="button" onClick={assistant.cancel}><Icon name="stop" size={14}/> Stop</button> : <button className="send" type="submit" disabled={!draft.trim()}><Icon name="send" size={17}/></button>}</div></form><span className="sr-only" aria-live="polite">Theta is {STATUS[assistant.status].toLowerCase()}</span>
+  </div>;
+}
+function CalendarView({ calendarId }: { calendarId: string }) {
+  const [events, setEvents] = useState<CalEvent[]>([]), [calendars, setCalendars] = useState<CalendarSummary[]>([]), [error, setError] = useState(""), [quick, setQuick] = useState("");
+  const refresh = useCallback(async () => { setError(""); try { const [cs, es] = await Promise.all([invoke<CalendarSummary[]>("calendar_list_calendars"), invoke<CalEvent[]>("calendar_list_events", { calendarId, maxResults: 50 })]); setCalendars(cs); setEvents(es); } catch (e) { setError(String(e)); } }, [calendarId]);
+  useEffect(() => { void refresh(); }, [refresh]);
+  const add = async (event: FormEvent) => { event.preventDefault(); if (!quick.trim() || !window.confirm(`Add this calendar event?\n\n${quick}`)) return; try { await invoke("calendar_quick_add", { text: quick, calendarId }); setQuick(""); await refresh(); } catch (e) { setError(String(e)); } };
+  const remove = async (event: CalEvent) => { if (!window.confirm(`Delete “${event.summary}”?`)) return; try { await invoke("calendar_delete_event", { eventId: event.id, calendarId: event.calendar_id }); await refresh(); } catch (e) { setError(String(e)); } };
+  return <Panel title="Calendar" subtitle={`${calendars.length} calendars connected`} action={<button onClick={() => void refresh()}>Refresh</button>}><form className="quick-form" onSubmit={add}><label htmlFor="quick-event">Quick add</label><input id="quick-event" value={quick} onChange={(e) => setQuick(e.target.value)} placeholder="Lunch with Sam tomorrow at noon" /><button className="primary">Review & add</button></form>{error && <div className="notice error">{error}</div>}<div className="list">{events.length ? events.map((event) => <article className="list-row" key={event.id}><div className="date-block"><b>{new Date(event.start).toLocaleDateString([], { day: "2-digit" })}</b><span>{new Date(event.start).toLocaleDateString([], { month: "short" })}</span></div><div className="grow"><b>{event.summary}</b><small>{fmt(event.start)} · {event.location ?? event.calendar_id}</small></div><button className="danger ghost" onClick={() => void remove(event)}>Delete</button></article>) : <Empty>No upcoming events found.</Empty>}</div></Panel>;
 }
 
+function SystemView() {
+  const [stats, setStats] = useState<SystemStats | null>(null), [processes, setProcesses] = useState<ProcessInfo[]>([]), [ports, setPorts] = useState<PortInfo[]>([]), [filter, setFilter] = useState(""), [error, setError] = useState("");
+  const refresh = useCallback(async () => { setError(""); try { const [s, p, n] = await Promise.all([invoke<SystemStats>("system_stats"), invoke<ProcessInfo[]>("list_processes", { query: { filter: filter || undefined, sort_by: "cpu", limit: 80 } }), invoke<PortInfo[]>("listening_ports")]); setStats(s); setProcesses(p); setPorts(n); } catch (e) { setError(String(e)); } }, [filter]);
+  useEffect(() => { void refresh(); }, [refresh]);
+  const kill = async (proc: ProcessInfo) => { if (!window.confirm(`Force stop ${proc.name} (PID ${proc.pid})? Unsaved work may be lost.`)) return; try { await invoke("kill_process", { pid: proc.pid }); await refresh(); } catch (e) { setError(String(e)); } };
+  return <Panel title="System" subtitle="Live local inspection" action={<button onClick={() => void refresh()}>Refresh</button>}>{error && <div className="notice error">{error}</div>}{stats && <div className="stats"><div><span>CPU</span><b>{stats.cpu_usage}%</b><i style={{ width: `${stats.cpu_usage}%` }} /></div><div><span>Memory</span><b>{stats.mem_percent}%</b><i style={{ width: `${stats.mem_percent}%` }} /></div><div><span>Processes</span><b>{stats.process_count}</b></div><div><span>Listening ports</span><b>{ports.length}</b></div></div>}<div className="section-title"><h2>Processes</h2><input aria-label="Filter processes" value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter" /></div><div className="table-wrap"><table><thead><tr><th>Name</th><th>PID</th><th>CPU</th><th>Memory</th><th /></tr></thead><tbody>{processes.map((proc) => <tr key={proc.pid}><td><b>{proc.name}</b><small>{proc.cmd}</small></td><td>{proc.pid}</td><td>{proc.cpu}%</td><td>{proc.memory_mb} MB</td><td><button className="danger ghost" onClick={() => void kill(proc)}>Stop</button></td></tr>)}</tbody></table></div><details className="ports"><summary>Listening ports ({ports.length})</summary>{ports.map((port) => <code key={`${port.proto}-${port.port}-${port.pid}`}>{port.proto} {port.address} · {port.process} ({port.pid})</code>)}</details></Panel>;
+}
+function MemoryView() {
+  const [docs, setDocs] = useState<RagDoc[]>([]), [profile, setProfile] = useState<ProfileItem[]>([]), [note, setNote] = useState(""), [title, setTitle] = useState(""), [path, setPath] = useState(""), [error, setError] = useState("");
+  const refresh = useCallback(async () => { try { const [nextDocs, nextProfile] = await Promise.all([invoke<RagDoc[]>("rag_list", { limit: 200 }), invoke<ProfileItem[]>("profile_get")]); setDocs(nextDocs); setProfile(nextProfile); } catch (e) { setError(String(e)); } }, []);
+  useEffect(() => { void refresh(); }, [refresh]);
+  const saveNote = async (event: FormEvent) => { event.preventDefault(); if (!note.trim() || !window.confirm(`Save “${title || "Note"}” to local memory?`)) return; try { await invoke("rag_ingest_text", { text: note, title: title || undefined, source: "note", tags: ["manual"] }); setNote(""); setTitle(""); await refresh(); } catch (e) { setError(String(e)); } };
+  const ingest = async () => { if (!path.trim() || !window.confirm(`Read and save this file into local memory?\n${path}`)) return; try { await invoke("rag_ingest_file", { path }); setPath(""); await refresh(); } catch (e) { setError(String(e)); } };
+  const forget = async (doc: RagDoc) => { if (!window.confirm(`Forget “${doc.title}” from local memory?`)) return; try { await invoke("rag_forget", { id: doc.id }); await refresh(); } catch (e) { setError(String(e)); } };
+  const forgetProfile = async (item: ProfileItem) => { if (!window.confirm(`Forget “${item.text}” from About me?`)) return; try { await invoke("profile_remove", { id: item.id }); await refresh(); } catch (e) { setError(String(e)); } };
+  const clearProfile = async () => { if (!window.confirm("Clear everything Theta has learned in About me?")) return; try { await invoke("profile_clear"); await refresh(); } catch (e) { setError(String(e)); } };
+  const groups = Object.entries(profile.reduce<Record<string, ProfileItem[]>>((all, item) => { (all[item.category] ??= []).push(item); return all; }, {}));
+  return <Panel title="Memory" subtitle={`${profile.length} profile facts · ${docs.length} indexed chunks`} action={<button onClick={() => void refresh()}>Refresh</button>}><section className="card about-card"><div className="section-title"><div><h2>About me</h2><p className="muted">Learnt automatically from your conversations and refined over time.</p></div>{profile.length > 0 && <button className="danger ghost" onClick={() => void clearProfile()}>Clear all</button>}</div>{groups.length ? <div className="profile-groups">{groups.map(([category, items]) => <section key={category}><h3>{category.replace(/_/g, " ")}</h3>{items?.map((item) => <div className="profile-fact" key={item.id}><div><b>{item.text}</b><small>{Math.round(item.confidence * 100)}% confidence · {item.evidenceCount} signal{item.evidenceCount === 1 ? "" : "s"} · {new Date(item.lastSeen * 1000).toLocaleDateString()}</small></div><button className="danger ghost" onClick={() => void forgetProfile(item)}>Forget</button></div>)}</section>)}</div> : <Empty>Theta will build this profile as you talk.</Empty>}</section><div className="memory-grid"><form className="card form-stack" onSubmit={saveNote}><h2>Save a note</h2><label>Title<input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Optional title" /></label><label>Text<textarea value={note} onChange={(e) => setNote(e.target.value)} rows={5} /></label><button className="primary">Review & save</button></form><div className="card form-stack"><h2>Ingest a file</h2><label>Absolute UTF-8 file path<input value={path} onChange={(e) => setPath(e.target.value)} placeholder="C:\\notes\\project.txt" /></label><button onClick={() => void ingest()}>Review & ingest</button></div></div>{error && <div className="notice error">{error}</div>}<div className="list memory-list">{docs.map((doc) => <article className="list-row" key={doc.id}><span className="memory-mark">◇</span><div className="grow"><b>{doc.title}</b><small>{doc.source} · {new Date(doc.created * 1000).toLocaleDateString()}</small><p>{doc.preview}</p></div><button className="danger ghost" onClick={() => void forget(doc)}>Forget</button></article>)}</div></Panel>;
+}
+
+function SettingsView({ assistant }: { assistant: ReturnType<typeof useVoiceAssistant> }) {
+  const { settings, save } = { settings: assistant.settings, save: assistant.saveSettings };
+  const voices = [["en-GB-SoniaNeural", "Sonia — British English"], ["en-GB-RyanNeural", "Ryan — British English"], ["en-GB-LibbyNeural", "Libby — British English"], ["en-US-AvaMultilingualNeural", "Ava — US English"], ["en-US-AndrewMultilingualNeural", "Andrew — US English"]];
+  const [draft, setDraft] = useState(settings), [auth, setAuth] = useState<AuthStatus | null>(null), [clientId, setClientId] = useState(""), [secret, setSecret] = useState(""), [message, setMessage] = useState("");
+  useEffect(() => setDraft(settings), [settings]);
+  const authRefresh = useCallback(() => invoke<AuthStatus>("google_auth_status").then(setAuth).catch((e) => setMessage(String(e))), []);
+  useEffect(() => { void authRefresh(); }, [authRefresh]);
+  const set = <K extends keyof Settings>(key: K, value: Settings[K]) => setDraft((current) => ({ ...current, [key]: value }));
+  const credentials = async (event: FormEvent) => { event.preventDefault(); try { await invoke("google_set_credentials", { clientId, clientSecret: secret || undefined }); setMessage("Credentials saved locally."); setClientId(""); setSecret(""); await authRefresh(); } catch (e) { setMessage(String(e)); } };
+  const connect = async () => { try { setMessage("Waiting for Google sign-in..."); const account = await invoke<string>("google_connect"); setMessage(`Connected as ${account}.`); await authRefresh(); } catch (e) { setMessage(String(e)); } };
+  const disconnect = async () => { if (!window.confirm("Disconnect Google Calendar from Theta?")) return; try { await invoke("google_disconnect"); setMessage("Google Calendar disconnected."); await authRefresh(); } catch (e) { setMessage(String(e)); } };
+  return <Panel title="Settings" subtitle="Fine-tune how Theta works for you" action={<button className="primary" onClick={() => void save(draft)}>Save changes</button>}><div className="settings-grid"><section className="card form-stack"><span className="card-kicker">VOICE & INTELLIGENCE</span><h2>Assistant</h2><label>OpenRouter model<input value={draft.model} onChange={(e) => set("model", e.target.value)} /></label><label>Neural voice<select value={draft.voice} onChange={(e) => set("voice", e.target.value)}>{!voices.some(([id]) => id === draft.voice) && <option value={draft.voice}>{draft.voice}</option>}{voices.map(([id, label]) => <option value={id} key={id}>{label}</option>)}</select><small>High-quality Microsoft neural speech with a local system fallback.</small></label><button type="button" className="voice-test" disabled={assistant.isTestingVoice} onClick={() => void assistant.testVoice(draft.voice)}>{assistant.isTestingVoice ? "Testing voice…" : "Test this voice"}</button>{assistant.speechDiagnostic && <p className="diagnostic">{assistant.speechDiagnostic.detail}{assistant.speechDiagnostic.firstAudioMs ? ` · ${assistant.speechDiagnostic.firstAudioMs} ms` : ""}</p>}<label>Default calendar<input value={draft.calendarId} onChange={(e) => set("calendarId", e.target.value)} /></label><label className="toggle"><input type="checkbox" checked={draft.speakReplies} onChange={(e) => set("speakReplies", e.target.checked)} /><span />Speak replies</label><label className="toggle"><input type="checkbox" checked={draft.useRag} onChange={(e) => set("useRag", e.target.checked)} /><span />Use local memory context</label><label className="toggle"><input type="checkbox" checked={draft.allowWeb} onChange={(e) => set("allowWeb", e.target.checked)} /><span />Allow web search tool</label><label className="toggle"><input type="checkbox" checked={draft.autoApprove} onChange={(e) => set("autoApprove", e.target.checked)} /><span />Auto-approve protected actions</label><small className="approval-warning">Calendar changes, shell commands, process termination, and memory changes will run without asking.</small></section><section className="card form-stack"><span className="card-kicker">DESKTOP</span><h2>Presence</h2><label>Global hotkey<input value={draft.hotkey} onChange={(e) => set("hotkey", e.target.value)} /></label><label className="toggle"><input type="checkbox" checked={draft.autoListenOnShow} onChange={(e) => set("autoListenOnShow", e.target.checked)} /><span />Listen when summoned</label><label className="toggle"><input type="checkbox" checked={draft.closeToTray} onChange={(e) => set("closeToTray", e.target.checked)} /><span />Close to tray</label><label className="toggle"><input type="checkbox" checked={draft.launchAtLogin} onChange={(e) => set("launchAtLogin", e.target.checked)} /><span />Launch at login</label></section><form className="card form-stack google-card" onSubmit={credentials}><div className="integration-head"><div><span className="card-kicker">INTEGRATION</span><h2>Google Calendar</h2></div><span className={`connection-badge ${auth?.connected ? "connected" : ""}`}>{auth?.connected ? "Connected" : "Not connected"}</span></div><p className="muted">{auth?.connected ? `Signed in${auth.email ? ` as ${auth.email}` : ""}.` : "Connect your account to read and manage events with approval."}</p><label>OAuth client ID<input value={clientId} onChange={(e) => setClientId(e.target.value)} autoComplete="off" /></label><label>Client secret (optional)<input type="password" value={secret} onChange={(e) => setSecret(e.target.value)} autoComplete="new-password" /></label><div className="button-row"><button>Save credentials</button><button type="button" className="primary" disabled={!auth?.has_credentials} onClick={() => void connect()}>Connect</button>{auth?.connected && <button type="button" className="danger" onClick={() => void disconnect()}>Disconnect</button>}</div>{message && <p className="muted">{message}</p>}</form></div></Panel>;
+}
+function DebugView({ assistant }: { assistant: ReturnType<typeof useVoiceAssistant> }) {
+  const lines = assistant.debugLogs;
+  const copy = () => void navigator.clipboard.writeText(lines.join("\n"));
+  return <Panel title="Debug console" subtitle="Runtime errors, voice diagnostics and backend events" action={<button onClick={copy} disabled={!lines.length}><Icon name="copy" size={15}/> Copy logs</button>}><div className="debug-summary"><span><b>{lines.length}</b> captured events</span><span>Voice: <b>{assistant.speechDiagnostic?.stage ?? "idle"}</b></span>{assistant.speechDiagnostic?.firstAudioMs !== undefined && <span>First audio: <b>{assistant.speechDiagnostic.firstAudioMs} ms</b></span>}</div><div className="debug-console" role="log" aria-live="polite">{lines.length ? lines.map((line, index) => <div key={`${index}-${line}`}><span>{String(index + 1).padStart(3, "0")}</span><code>{line}</code></div>) : <Empty>No runtime errors captured yet.</Empty>}</div></Panel>;
+}
 function App() {
-  const { status, partial, transcript, errorMessage, toggleListening, debugLogs } =
-    useVoiceAssistant();
-  const logEndRef = useRef<HTMLDivElement>(null);
-  const debugEndRef = useRef<HTMLDivElement>(null);
-
-  useEffect(()=>{
-    async function t(){
-      await register('CommandOrControl+E',async(event)=>{if (event.state == 'Pressed'){
-        await toggleListening();
-      }})
-    }
-    t();
-
-    return () => {
-    async function teardownShortcut() {
-      await unregister('CommandOrControl+E');
-    }
-    teardownShortcut();
-  };
-  },[])
-  useEffect(() => {
-    logEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [transcript, partial]);
-
-  useEffect(() => {
-    debugEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [debugLogs]);
-
-  return (
-    <div className="app">
-      <header className="statusbar">
-        <div className="statusbar__mark">
-          <span className="statusbar__glyph">θ</span>
-          <span>Theta</span>
-        </div>
-        <div className={`statusbar__state statusbar__state--${status}`}>
-          <span className="statusbar__dot" />
-          {STATUS_COPY[status]}
-        </div>
-      </header>
-
-      <main className="log">
-        {transcript.length === 0 && !partial && (
-          <div className="log__empty">
-            No signal yet. Press the dial and say something.
-          </div>
-        )}
-
-        {transcript.map((entry) => (
-          <div key={entry.id} className={`entry entry--${entry.role}`}>
-            <span className="entry__label">
-              {entry.role === "user" ? "YOU" : "THETA"}
-            </span>
-            <p className="entry__text">{entry.text}</p>
-          </div>
-        ))}
-
-        {partial && (
-          <div className="entry entry--user entry--partial">
-            <span className="entry__label">YOU</span>
-            <p className="entry__text">{partial}</p>
-          </div>
-        )}
-
-        <div ref={logEndRef} />
-      </main>
-
-      {status === "error" && errorMessage && (
-        <div className="banner" role="alert">
-          {errorMessage} — press the dial to retry.
-        </div>
-      )}
-
-      <footer className="console">
-        <div className="debug-panel">
-          {debugLogs.length === 0 && <div className="debug-panel__empty">Awaiting telemetry...</div>}
-          {debugLogs.map((log, i) => (
-            <div key={i} className="debug-panel__line">{log}</div>
-          ))}
-          <div ref={debugEndRef} />
-        </div>
-        <Dial status={status} onPress={toggleListening} />
-      </footer>
-    </div>
-  );
+  const assistant = useVoiceAssistant(); const [view, setView] = useState<View>("chat");
+  const content = useMemo(() => { switch (view) { case "chat": return <ChatView assistant={assistant} />; case "calendar": return <CalendarView calendarId={assistant.settings.calendarId} />; case "system": return <SystemView />; case "memory": return <MemoryView />; case "settings": return <SettingsView assistant={assistant} />; case "debug": return <DebugView assistant={assistant} />; } }, [assistant, view]);
+  return <div className="app"><WindowChrome /><div className="workspace"><nav className="nav-rail" aria-label="Main navigation"><div className="nav-items">{NAV.map(([id, label]) => <button key={id} className={view === id ? "selected" : ""} onClick={() => setView(id)} aria-label={label} title={label}><Icon name={id}/><small>{label}</small></button>)}</div><div className={`status-pill ${assistant.status}`}><VoicePresence status={assistant.status} level={assistant.level}/><span>{STATUS[assistant.status]}</span></div></nav><main className="content">{content}</main></div>{assistant.errorMessage && <button className="error-bar" onClick={() => assistant.setErrorMessage("")}>{assistant.errorMessage}<span>×</span></button>}<div className="toasts" aria-live="polite">{assistant.toasts.map((toast) => <div className={`toast ${toast.tone}`} key={toast.id}>{toast.text}</div>)}</div></div>;
 }
-
 export default App;

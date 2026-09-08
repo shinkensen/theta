@@ -1,9 +1,0 @@
-{
-	"id": "fgB46tnFD3C1tG4",
-	"json": "{\"id\":\"fgB46tnFD3C1tG4\",\"url\":\"https://www.ebsco.com/research-starters/computer-science/apple-inc\",\"loadedUrl\":\"https://www.ebsco.com/research-starters/computer-science/apple-inc\",\"uniqueKey\":\"https://www.ebsco.com/research-starters/computer-science/apple-inc\",\"method\":\"GET\",\"noRetry\":false,\"retryCount\":0,\"errorMessages\":[],\"headers\":{},\"userData\":{\"__crawlee\":{\"state\":4}},\"handledAt\":\"2026-07-17T03:21:17.906Z\"}",
-	"method": "GET",
-	"orderNo": null,
-	"retryCount": 0,
-	"uniqueKey": "https://www.ebsco.com/research-starters/computer-science/apple-inc",
-	"url": "https://www.ebsco.com/research-starters/computer-science/apple-inc"
-}

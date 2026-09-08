@@ -1,9 +1,0 @@
-{
-	"id": "PMKcwkEIFOpWph8",
-	"json": "{\"id\":\"PMKcwkEIFOpWph8\",\"url\":\"https://www.britannica.com/money/Apple-Inc\",\"loadedUrl\":\"https://www.britannica.com/money/Apple-Inc\",\"uniqueKey\":\"https://www.britannica.com/money/Apple-Inc\",\"method\":\"GET\",\"noRetry\":false,\"retryCount\":0,\"errorMessages\":[],\"headers\":{},\"userData\":{\"__crawlee\":{\"state\":4}},\"handledAt\":\"2026-07-17T03:21:17.991Z\"}",
-	"method": "GET",
-	"orderNo": null,
-	"retryCount": 0,
-	"uniqueKey": "https://www.britannica.com/money/Apple-Inc",
-	"url": "https://www.britannica.com/money/Apple-Inc"
-}

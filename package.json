@@ -21,6 +21,7 @@
     "microsoft-cognitiveservices-speech-sdk": "^1.50.0",
     "node": "^26.4.0",
     "nodefs": "^0.0.2",
+    "openai": "^7.5.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "tauri-plugin-audio-recorder-api": "^0.1.0",

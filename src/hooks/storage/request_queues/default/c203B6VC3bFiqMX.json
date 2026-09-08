@@ -1,9 +1,0 @@
-{
-	"id": "c203B6VC3bFiqMX",
-	"json": "{\"id\":\"c203B6VC3bFiqMX\",\"url\":\"https://www.apple.com/\",\"loadedUrl\":\"https://www.apple.com/\",\"uniqueKey\":\"https://www.apple.com\",\"method\":\"GET\",\"noRetry\":false,\"retryCount\":0,\"errorMessages\":[],\"headers\":{},\"userData\":{\"__crawlee\":{\"state\":4}},\"handledAt\":\"2026-07-17T03:21:18.603Z\"}",
-	"method": "GET",
-	"orderNo": null,
-	"retryCount": 0,
-	"uniqueKey": "https://www.apple.com",
-	"url": "https://www.apple.com/"
-}

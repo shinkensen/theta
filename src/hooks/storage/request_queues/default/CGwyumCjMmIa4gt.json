@@ -1,9 +1,0 @@
-{
-	"id": "CGwyumCjMmIa4gt",
-	"json": "{\"id\":\"CGwyumCjMmIa4gt\",\"url\":\"https://www.weforum.org/organizations/apple/\",\"loadedUrl\":\"https://www.weforum.org/organizations/apple/\",\"uniqueKey\":\"https://www.weforum.org/organizations/apple\",\"method\":\"GET\",\"noRetry\":false,\"retryCount\":0,\"errorMessages\":[],\"headers\":{},\"userData\":{\"__crawlee\":{\"state\":4}},\"handledAt\":\"2026-07-17T03:21:20.934Z\"}",
-	"method": "GET",
-	"orderNo": null,
-	"retryCount": 0,
-	"uniqueKey": "https://www.weforum.org/organizations/apple",
-	"url": "https://www.weforum.org/organizations/apple/"
-}

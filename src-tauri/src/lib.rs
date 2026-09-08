@@ -1,494 +1,67 @@
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use serde::Serialize;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
-use tauri::{AppHandle, Emitter, State};
-use vosk::{CompleteResult, DecodingState, Model, Recognizer};
+//! Theta — a local-first voice assistant.
+//!
+//! The Rust side owns everything that has to work whether or not the window is
+//! visible, plus everything that would be slow or unsafe in the webview:
+//!
+//! | module      | what it does                                              |
+//! |-------------|-----------------------------------------------------------|
+//! | [`stt`]     | Vosk speech-to-text over a cpal capture stream            |
+//! | [`rag`]     | local hybrid retrieval (BM25 + character trigrams)        |
+//! | [`procs`]   | process / system / port inspection, shell commands        |
+//! | [`calendar`]| Google Calendar OAuth + v3 CRUD                           |
+//! | [`settings`]| persisted preferences (hotkey, voice, model, …)            |
+//!
+//! The frontend is a chat UI plus an agent loop that calls these as tools.
+//!
+//! Background operation is the reason the global shortcut and tray live here
+//! rather than in the webview: a shortcut registered from JS only fires while
+//! the window has focus, which defeats the point.
 
-/// Timestamp string for debug log lines: `HH:MM:SS.mmm` (UTC-ish, good
-/// enough for a relative-ordered debug panel).
-fn now_stamp() -> String {
-    let dur = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = dur.as_secs() as i64;
-    let millis = dur.subsec_millis();
-    let h = ((secs / 3600) % 24) as u32;
-    let m = ((secs / 60) % 60) as u32;
-    let s = (secs % 60) as u32;
-    format!("{h:02}:{m:02}:{s:02}.{millis:03}")
-}
+pub mod calendar;
+pub mod procs;
+pub mod profile;
+pub mod rag;
+pub mod settings;
+pub mod stt;
 
-pub struct ListeningState {
-    is_listening: Arc<AtomicBool>,
-    model: Arc<Model>,
-    /// Last partial text captured by the stream callback, so that when the
-    /// user stops listening we can flush it as a final result instead of
-    /// silently dropping whatever they were saying.
-    last_partial: Arc<Mutex<String>>,
-    debug_log: Arc<Mutex<Vec<String>>>,
-}
+use tauri::menu::{MenuBuilder, MenuEvent};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{AppHandle, Emitter, Manager, WindowEvent};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
-impl ListeningState {
-    pub fn new(model_path: &str) -> Self {
-        eprintln!("[theta] Loading Vosk model from {model_path}");
-        let model = Model::new(model_path).unwrap_or_else(|| {
-            panic!(
-                "[theta] Failed to load Vosk model from '{model_path}'. \
-                Ensure the model directory exists and is a valid Vosk model."
-            )
-        });
-        eprintln!("[theta] Vosk model loaded successfully");
-        Self {
-            is_listening: Arc::new(AtomicBool::new(false)),
-            model: Arc::new(model),
-            last_partial: Arc::new(Mutex::new(String::new())),
-            debug_log: Arc::new(Mutex::new(vec![format!(
-                "[{}] model loaded: {model_path}",
-                now_stamp()
-            )])),
-        }
-    }
+/// The one window Theta has. Used everywhere instead of `get_focused_window`,
+/// which is `None` exactly when we care most (hidden or unfocused).
+const MAIN_WINDOW: &str = "main";
 
-    /// Push a debug line to stderr, the in-memory log buffer, and the
-    /// `theta-debug` event stream (consumed by the mini console in the UI).
-    fn log(&self, app: &AppHandle, msg: impl Into<String>) {
-        let entry = format!("[{}] {}", now_stamp(), msg.into());
-        eprintln!("[theta] {entry}");
-        if let Ok(mut log) = self.debug_log.lock() {
-            log.push(entry.clone());
-            if log.len() > 500 {
-                let drop = log.len() - 500;
-                log.drain(0..drop);
-            }
-        }
-        let _ = app.emit("theta-debug", entry);
-    }
-}
-
-#[tauri::command]
-fn start_listening(app_handle: AppHandle, state: State<'_, ListeningState>) -> Result<(), String> {
-    if state.is_listening.swap(true, Ordering::SeqCst) {
-        return Err("Already listening".to_string());
-    }
-
-    if let Ok(mut p) = state.last_partial.lock() {
-        p.clear();
-    }
-    state.log(&app_handle, "start_listening: requested");
-
-    let is_listening = Arc::clone(&state.is_listening);
-    let model = Arc::clone(&state.model);
-    let last_partial = Arc::clone(&state.last_partial);
-    let app_for_thread = app_handle.clone();
-
-    std::thread::spawn(move || {
-        if let Err(e) = run_listening_loop(
-            app_for_thread.clone(),
-            model,
-            Arc::clone(&is_listening),
-            last_partial,
-        ) {
-            eprintln!("Listening thread error: {e}");
-            let _ = app_for_thread.emit("vosk-error", e.clone());
-            let _ = app_for_thread.emit(
-                "theta-debug",
-                format!("[{}] start_listening error: {e}", now_stamp()),
-            );
-        }
-        is_listening.store(false, Ordering::SeqCst);
-        let _ = app_for_thread.emit(
-            "theta-debug",
-            format!("[{}] listening thread exited", now_stamp()),
-        );
-    });
-
-    Ok(())
-}
-
-#[tauri::command]
-fn stop_listening(app_handle: AppHandle, state: State<'_, ListeningState>) {
-    state.log(&app_handle, "stop_listening: requested");
-    state.is_listening.store(false, Ordering::SeqCst);
-
-    let _ = app_handle.emit("vosk-speech-partial", "");
-}
-
-#[tauri::command]
-fn get_debug_log(state: State<'_, ListeningState>) -> Vec<String> {
-    state
-        .debug_log
-        .lock()
-        .map(|log| log.clone())
-        .unwrap_or_default()
-}
-
-fn run_listening_loop(
-    app_handle: AppHandle,
-    model: Arc<Model>,
-    is_listening: Arc<AtomicBool>,
-    last_partial: Arc<Mutex<String>>,
-) -> Result<(), String> {
-    let host = cpal::default_host();
-    let device = host.default_input_device().ok_or("No input device found")?;
-    let supported_config = device
-        .default_input_config()
-        .map_err(|e| format!("Failed to get input config: {e}"))?;
-
-    // Extract info before supported_config is consumed by .into()
-    let device_sample_rate: u32 = supported_config.sample_rate();
-    let device_channels = supported_config.channels() as usize;
-    let sample_format = supported_config.sample_format();
-    // Get device name before device is moved into closures
-    let device_name = device.to_string();
-
-    let _ = app_handle.emit(
-        "theta-debug",
-        format!(
-            "[{}] device: {} | ch={} rate={} fmt={:?}",
-            now_stamp(),
-            device_name,
-            device_channels,
-            device_sample_rate,
-            sample_format,
-        ),
-    );
-
-    // Vosk requires 16 kHz mono i16 audio.
-    // We always feed the recognizer at 16000 Hz regardless of device rate.
-    const VOSK_RATE: f32 = 16000.0;
-    let mut recognizer = Recognizer::new(&model, VOSK_RATE).ok_or("Failed to create recognizer")?;
-    recognizer.set_words(true);
-
-    // Shared recognizer behind a mutex so the stream callback (which may run
-    // on a separate audio thread) can safely hand samples to Vosk.
-    let recognizer = Arc::new(Mutex::new(recognizer));
-
-    let config: cpal::StreamConfig = supported_config.into();
-    let app_for_stream = app_handle.clone();
-    let last_partial_for_stream = Arc::clone(&last_partial);
-    let level_tick = Arc::new(std::sync::atomic::AtomicU32::new(0));
-    let level_tick_stream = Arc::clone(&level_tick);
-    let recognizer_stream = Arc::clone(&recognizer);
-
-    // Accumulate fractional resampling error across callbacks.
-    let resample_acc = Arc::new(Mutex::new(0.0f64));
-    let resample_acc_stream = Arc::clone(&resample_acc);
-
-    // Build the stream using the device's native format.
-    // We down-mix to mono and linearly resample to VOSK_RATE on the fly.
-    let build_result = match sample_format {
-        cpal::SampleFormat::F32 => device.build_input_stream(
-            config.clone(),
-            move |data: &[f32], _: &_| {
-                let mono: Vec<f32> = if device_channels == 1 {
-                    data.to_vec()
-                } else {
-                    data.chunks(device_channels)
-                        .map(|ch| ch.iter().sum::<f32>() / device_channels as f32)
-                        .collect()
-                };
-                let resampled = resample_f32(
-                    &mono,
-                    device_sample_rate,
-                    VOSK_RATE as u32,
-                    &resample_acc_stream,
-                );
-                let tick = level_tick_stream.fetch_add(1, Ordering::Relaxed);
-                if tick % 10 == 0 {
-                    let rms = (resampled
-                        .iter()
-                        .map(|s| (*s as f32) * (*s as f32))
-                        .sum::<f32>()
-                        / resampled.len().max(1) as f32)
-                        .sqrt();
-                    let _ = app_for_stream.emit(
-                        "theta-level",
-                        (rms / i16::MAX as f32 * 1000.0).round() as i32,
-                    );
-                }
-                if let Ok(mut rec) = recognizer_stream.lock() {
-                    process_samples_i16(
-                        &mut rec,
-                        &resampled,
-                        &app_for_stream,
-                        &last_partial_for_stream,
-                    );
-                }
-            },
-            |err| eprintln!("Audio stream error: {err}"),
-            None,
-        ),
-        cpal::SampleFormat::I16 => device.build_input_stream(
-            config.clone(),
-            move |data: &[i16], _: &_| {
-                let f32_data: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-                let mono: Vec<f32> = if device_channels == 1 {
-                    f32_data
-                } else {
-                    f32_data
-                        .chunks(device_channels)
-                        .map(|ch| ch.iter().sum::<f32>() / device_channels as f32)
-                        .collect()
-                };
-                let resampled = resample_f32(
-                    &mono,
-                    device_sample_rate,
-                    VOSK_RATE as u32,
-                    &resample_acc_stream,
-                );
-                let tick = level_tick_stream.fetch_add(1, Ordering::Relaxed);
-                if tick % 10 == 0 {
-                    let rms = (resampled
-                        .iter()
-                        .map(|s| (*s as f32) * (*s as f32))
-                        .sum::<f32>()
-                        / resampled.len().max(1) as f32)
-                        .sqrt();
-                    let _ = app_for_stream.emit(
-                        "theta-level",
-                        (rms / i16::MAX as f32 * 1000.0).round() as i32,
-                    );
-                }
-                if let Ok(mut rec) = recognizer_stream.lock() {
-                    process_samples_i16(
-                        &mut rec,
-                        &resampled,
-                        &app_for_stream,
-                        &last_partial_for_stream,
-                    );
-                }
-            },
-            |err| eprintln!("Audio stream error: {err}"),
-            None,
-        ),
-        cpal::SampleFormat::U16 => device.build_input_stream(
-            config,
-            move |data: &[u16], _: &_| {
-                let f32_data: Vec<f32> = data
-                    .iter()
-                    .map(|&s| (s as f32 - 32768.0) / 32768.0)
-                    .collect();
-                let mono: Vec<f32> = if device_channels == 1 {
-                    f32_data
-                } else {
-                    f32_data
-                        .chunks(device_channels)
-                        .map(|ch| ch.iter().sum::<f32>() / device_channels as f32)
-                        .collect()
-                };
-                let resampled = resample_f32(
-                    &mono,
-                    device_sample_rate,
-                    VOSK_RATE as u32,
-                    &resample_acc_stream,
-                );
-                let tick = level_tick_stream.fetch_add(1, Ordering::Relaxed);
-                if tick % 10 == 0 {
-                    let rms = (resampled
-                        .iter()
-                        .map(|s| (*s as f32) * (*s as f32))
-                        .sum::<f32>()
-                        / resampled.len().max(1) as f32)
-                        .sqrt();
-                    let _ = app_for_stream.emit(
-                        "theta-level",
-                        (rms / i16::MAX as f32 * 1000.0).round() as i32,
-                    );
-                }
-                if let Ok(mut rec) = recognizer_stream.lock() {
-                    process_samples_i16(
-                        &mut rec,
-                        &resampled,
-                        &app_for_stream,
-                        &last_partial_for_stream,
-                    );
-                }
-            },
-            |err| eprintln!("Audio stream error: {err}"),
-            None,
-        ),
-        fmt => return Err(format!("Unsupported sample format: {fmt:?}")),
-    };
-
-    let stream = build_result.map_err(|e| format!("Failed to build input stream: {e}"))?;
-
-    stream
-        .play()
-        .map_err(|e| format!("Failed to start audio stream: {e}"))?;
-    let _ = app_handle.emit(
-        "theta-debug",
-        format!("[{}] stream.play() OK - listening", now_stamp()),
-    );
-
-    while is_listening.load(Ordering::SeqCst) {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    let _ = app_handle.emit(
-        "theta-debug",
-        format!("[{}] is_listening=false - stopping stream", now_stamp()),
-    );
-    drop(stream);
-
-    // If the user manually stops, the audio might still be in Vosk's buffer
-    // waiting for trailing silence. Flush it out now.
-    if let Ok(mut rec) = recognizer.lock() {
-        if let CompleteResult::Single(result) = rec.final_result() {
-            let text = result.text.trim().to_string();
-            if !text.is_empty() {
-                let _ = app_handle.emit("vosk-speech-result", text.clone());
-                let _ = app_handle.emit(
-                    "theta-debug",
-                    format!("[{}] FINAL (flushed on stop): {:?}", now_stamp(), text),
-                );
-                if let Ok(mut p) = last_partial.lock() {
-                    p.clear();
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Linear resampler: converts mono f32 audio from `src_rate` to `dst_rate`.
-/// `acc` carries the fractional sample offset across callback invocations so
-/// there are no seam clicks at chunk boundaries.
-fn resample_f32(input: &[f32], src_rate: u32, dst_rate: u32, acc: &Mutex<f64>) -> Vec<i16> {
-    if src_rate == dst_rate {
-        return input
-            .iter()
-            .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
-            .collect();
-    }
-    let ratio = src_rate as f64 / dst_rate as f64;
-    let mut out = Vec::new();
-    let mut pos = acc.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    while pos < input.len() as f64 {
-        let idx = pos as usize;
-        let frac = pos - idx as f64;
-        let s0 = input.get(idx).copied().unwrap_or(0.0);
-        let s1 = input.get(idx + 1).copied().unwrap_or(s0);
-        let sample = s0 + (s1 - s0) * frac as f32;
-        out.push((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16);
-        pos += ratio;
-    }
-    // Store remaining fractional offset for next callback
-    if let Ok(mut a) = acc.lock() {
-        *a = pos - input.len() as f64;
-        if *a < 0.0 {
-            *a = 0.0;
-        }
-    }
-    out
-}
-
-/// Feeds pre-converted i16 mono 16 kHz samples into the recognizer and emits
-/// final or partial results to the frontend.
-fn process_samples_i16(
-    recognizer: &mut Recognizer,
-    data: &[i16],
-    app_handle: &AppHandle,
-    last_partial: &Mutex<String>,
-) {
-    match recognizer.accept_waveform(data) {
-        Ok(DecodingState::Finalized) => {
-            if let CompleteResult::Single(result) = recognizer.result() {
-                let text = result.text.to_string();
-                if !text.is_empty() {
-                    let _ = app_handle.emit("vosk-speech-result", text.clone());
-                    let _ = app_handle
-                        .emit("theta-debug", format!("[{}] FINAL: {text:?}", now_stamp()));
-                    if let Ok(mut p) = last_partial.lock() {
-                        p.clear();
-                    }
-                }
-            }
-        }
-        Ok(_) => {
-            let partial = recognizer.partial_result();
-            let ptext = partial.partial.to_string();
-            if !ptext.is_empty() {
-                let _ = app_handle.emit("vosk-speech-partial", ptext.clone());
-                if let Ok(mut p) = last_partial.lock() {
-                    *p = ptext;
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("accept_waveform error: {e}");
-            let _ = app_handle.emit(
-                "theta-debug",
-                format!("[{}] accept_waveform error: {e}", now_stamp()),
-            );
-        }
-    }
-}
-
-// ---------------------------------------------------------------------
-// Existing commands
-// ---------------------------------------------------------------------
-
-#[derive(Serialize)]
-struct SystemInfo {
-    os: String,
-    arch: String,
-    uptime_secs: u64,
-    hostname: String,
-}
-
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! Welcome to Theta 🚀", name)
-}
-
-#[tauri::command]
-fn get_system_info() -> Result<SystemInfo, String> {
-    let os = std::env::consts::OS.to_string();
-    let arch = std::env::consts::ARCH.to_string();
-    let uptime_secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_secs();
-    let hostname = hostname::get()
-        .map(|h| h.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
-
-    Ok(SystemInfo {
-        os,
-        arch,
-        uptime_secs,
-        hostname,
-    })
-}
+// ---------------------------------------------------------------------------
+// Misc commands the frontend still uses
+// ---------------------------------------------------------------------------
 
 #[tauri::command]
 fn read_file_content(path: String) -> Result<String, String> {
-    std::fs::read_to_string(&path).map_err(|e| format!("Failed to read file '{}': {}", path, e))
+    std::fs::read_to_string(&path).map_err(|e| format!("Failed to read file '{path}': {e}"))
 }
 
 #[tauri::command]
 fn write_file_content(path: String, content: String) -> Result<String, String> {
     std::fs::write(&path, &content)
-        .map(|_| format!("Successfully wrote to {}", path))
-        .map_err(|e| format!("Failed to write to '{}': {}", path, e))
+        .map(|_| format!("Wrote {} bytes to {path}", content.len()))
+        .map_err(|e| format!("Failed to write to '{path}': {e}"))
 }
 
 #[tauri::command]
 fn list_directory(path: String) -> Result<Vec<String>, String> {
-    let entries = std::fs::read_dir(&path)
-        .map_err(|e| format!("Failed to read directory '{}': {}", path, e))?;
+    let entries =
+        std::fs::read_dir(&path).map_err(|e| format!("Failed to read directory '{path}': {e}"))?;
 
     let mut result: Vec<String> = entries
         .filter_map(|entry| {
             entry.ok().map(|e| {
                 let name = e.file_name().to_string_lossy().to_string();
                 if e.path().is_dir() {
-                    format!("📁 {}", name)
+                    format!("📁 {name}")
                 } else {
-                    format!("📄 {}", name)
+                    format!("📄 {name}")
                 }
             })
         })
@@ -498,17 +71,183 @@ fn list_directory(path: String) -> Result<Vec<String>, String> {
     Ok(result)
 }
 
-// ---------------------------------------------------------------------
+/// Brings the window back from the tray. Also used by the hotkey handler.
+#[tauri::command]
+fn show_window(app: AppHandle) -> Result<(), String> {
+    reveal(&app);
+    Ok(())
+}
+
+/// Hides to tray without quitting — what the titlebar's close button calls.
+#[tauri::command]
+fn hide_to_tray(app: AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window(MAIN_WINDOW) {
+        win.hide().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    app.exit(0);
+}
+
+// ---------------------------------------------------------------------------
+// Window / tray / hotkey plumbing
+// ---------------------------------------------------------------------------
+
+/// Show + unminimize + focus, in that order. Windows will not focus a hidden
+/// window, and `set_focus` on a minimized one is a no-op, so all three are
+/// needed for a reliable "summon" from the tray or hotkey.
+fn reveal(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window(MAIN_WINDOW) {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
+}
+
+/// The hotkey's job: bring Theta up and start listening in one press.
+///
+/// If the window is already up *and* the mic is live, the same press stops
+/// listening — so it acts as push-to-talk you don't have to hold.
+fn on_hotkey(app: &AppHandle) {
+    let was_visible = app
+        .get_webview_window(MAIN_WINDOW)
+        .and_then(|w| w.is_visible().ok())
+        .unwrap_or(false);
+
+    reveal(app);
+
+    let Some(stt) = app.try_state::<stt::SttState>() else {
+        return;
+    };
+    let auto_listen = app
+        .try_state::<settings::SettingsState>()
+        .map(|s| s.snapshot().auto_listen_on_show)
+        .unwrap_or(true);
+
+    // Revealing a hidden window shouldn't also stop an in-flight recording,
+    // so only toggle when the window was already on screen.
+    let start_only = !was_visible;
+    let result = if start_only {
+        if auto_listen {
+            stt::start(app, &stt).map(|_| true)
+        } else {
+            Ok(false)
+        }
+    } else {
+        stt::toggle(app, &stt)
+    };
+
+    match result {
+        Ok(listening) => {
+            let _ = app.emit("theta-hotkey", listening);
+        }
+        Err(e) => {
+            let _ = app.emit("vosk-error", e);
+        }
+    }
+}
+
+/// Re-registers the global shortcut when the user changes it in Settings.
+/// Called from [`settings::save_settings`].
+pub fn rebind_hotkey(app: &AppHandle, previous: &str, next: &str) -> Result<(), String> {
+    let shortcuts = app.global_shortcut();
+
+    // Register first: if `next` is unparseable or already owned by another
+    // app, we bail out with the old binding still live.
+    shortcuts
+        .on_shortcut(next, |app, _shortcut, event| {
+            if event.state == ShortcutState::Pressed {
+                on_hotkey(app);
+            }
+        })
+        .map_err(|e| format!("Couldn't bind '{next}': {e}. Keeping '{previous}'."))?;
+
+    if !previous.is_empty() && previous != next {
+        let _ = shortcuts.unregister(previous);
+    }
+    Ok(())
+}
+
+/// Flips the OS "run at login" entry.
+pub fn set_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let manager = app.autolaunch();
+    let result = if enabled {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+    result.map_err(|e| format!("Couldn't change the launch-at-login setting: {e}"))
+}
+
+fn on_tray_menu_event(app: &AppHandle, event: MenuEvent) {
+    match event.id().as_ref() {
+        "show" => reveal(app),
+        "listen" => {
+            reveal(app);
+            if let Some(stt) = app.try_state::<stt::SttState>() {
+                match stt::toggle(app, &stt) {
+                    Ok(listening) => {
+                        let _ = app.emit("theta-hotkey", listening);
+                    }
+                    Err(e) => {
+                        let _ = app.emit("vosk-error", e);
+                    }
+                }
+            }
+        }
+        "quit" => app.exit(0),
+        _ => {}
+    }
+}
+
+fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+    let menu = MenuBuilder::new(app)
+        .text("show", "Open Theta")
+        .text("listen", "Start / stop listening")
+        .separator()
+        .text("quit", "Quit")
+        .build()?;
+
+    let mut builder = TrayIconBuilder::with_id("theta-tray")
+        .tooltip("Theta — press Ctrl+Shift+Space to talk")
+        .menu(&menu)
+        // Left click summons the window; the menu stays on right click, which
+        // is what people expect from a tray icon on Windows.
+        .show_menu_on_left_click(false)
+        .on_menu_event(on_tray_menu_event)
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                reveal(tray.app_handle());
+            }
+        });
+
+    if let Some(icon) = app.default_window_icon().cloned() {
+        builder = builder.icon(icon);
+    }
+
+    builder.build(app)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // App entry point
-// ---------------------------------------------------------------------
+// ---------------------------------------------------------------------------
 
 /// Resolves the Vosk model directory.
 ///
-/// Looks for `vosk-models/vosk-model-small-en-us-0.15` relative to the
-/// running executable (works for `cargo run`/`tauri dev`, where the exe
-/// lives in `target/<profile>/`, by walking up to find `src-tauri`), and
-/// also relative to the crate manifest dir (set by Cargo at build time).
-/// Panics with a clear message if the model folder can't be found.
+/// Looks for `vosk-models/vosk-model-small-en-us-0.15` relative to the running
+/// executable (works for `cargo run`/`tauri dev`, where the exe lives in
+/// `target/<profile>/`, by walking up to find `src-tauri`), and also relative
+/// to the crate manifest dir. Panics with a clear message if not found.
 fn resolve_vosk_model_path() -> String {
     const MODEL_DIR_NAME: &str = "vosk-model-small-en-us-0.15";
     const RELATIVE_PATHS: &[&str] = &[
@@ -560,19 +299,111 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
-        .manage(ListeningState::new(&model_path))
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            // Launching at login should land in the tray, not pop a window in
+            // the user's face; the frontend reads this argv flag.
+            Some(vec!["--hidden"]),
+        ))
+        .manage(stt::SttState::new(&model_path))
+        .manage(procs::ProcState::new())
+        .setup(|app| {
+            // RAG and OAuth tokens are per-user state, so they live in the
+            // platform app-data dir rather than next to the binary.
+            let data_dir = app.path().app_data_dir().map_err(|e| {
+                format!("Couldn't resolve the app data directory: {e}")
+            })?;
+            std::fs::create_dir_all(&data_dir).map_err(|e| {
+                format!("Couldn't create {}: {e}", data_dir.display())
+            })?;
+
+            let settings = settings::SettingsState::load(&data_dir);
+            let hotkey = settings.snapshot().hotkey;
+
+            app.manage(rag::RagState::load(&data_dir));
+            app.manage(profile::ProfileState::load(&data_dir));
+            app.manage(calendar::CalendarState::load(&data_dir));
+            app.manage(settings);
+
+            let handle = app.handle();
+            if let Err(e) = rebind_hotkey(handle, "", &hotkey) {
+                // A taken hotkey is annoying, not fatal — the in-app mic
+                // button still works.
+                eprintln!("[theta] {e}");
+            }
+            if let Err(e) = build_tray(handle) {
+                eprintln!("[theta] tray icon unavailable: {e}");
+            }
+
+            // `--hidden` comes from the autostart entry.
+            if std::env::args().any(|a| a == "--hidden") {
+                if let Some(win) = app.get_webview_window(MAIN_WINDOW) {
+                    let _ = win.hide();
+                }
+            }
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let close_to_tray = window
+                    .app_handle()
+                    .try_state::<settings::SettingsState>()
+                    .map(|s| s.snapshot().close_to_tray)
+                    .unwrap_or(true);
+                if close_to_tray {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
         .invoke_handler(tauri::generate_handler![
-            greet,
-            get_system_info,
+            // files + window
             read_file_content,
             write_file_content,
             list_directory,
-            start_listening,
-            stop_listening,
-            get_debug_log,
+            show_window,
+            hide_to_tray,
+            quit_app,
+            // speech
+            stt::start_listening,
+            stt::stop_listening,
+            stt::toggle_listening,
+            stt::is_listening,
+            stt::get_debug_log,
+            stt::list_input_devices,
+            // processes / terminal
+            procs::list_processes,
+            procs::system_stats,
+            procs::kill_process,
+            procs::listening_ports,
+            procs::run_command,
+            // retrieval
+            rag::rag_ingest_text,
+            rag::rag_ingest_file,
+            rag::rag_search,
+            rag::rag_stats,
+            rag::rag_list,
+            rag::rag_forget,
+            // evolving user profile
+            profile::profile_get,
+            profile::profile_apply,
+            profile::profile_remove,
+            profile::profile_clear,
+            // calendar
+            calendar::google_auth_status,
+            calendar::google_set_credentials,
+            calendar::google_connect,
+            calendar::google_disconnect,
+            calendar::calendar_list_calendars,
+            calendar::calendar_list_events,
+            calendar::calendar_create_event,
+            calendar::calendar_update_event,
+            calendar::calendar_delete_event,
+            calendar::calendar_quick_add,
+            // settings
+            settings::get_settings,
+            settings::save_settings,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-
-pub mod temp;
