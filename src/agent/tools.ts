@@ -1,4 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
+import { executeIntegrationTool, hasIntegrationTool, integrationDefinitions, integrationProtectedTools, integrationRequiresConfirmation, integrationToolSummary } from "./integrationRegistry";
+import "./integrations/githubTools";
+import "./integrations/gmailTools";
+import "./integrations/hackatimeTools";
+import "./integrations/minestratorTools";
+import "./integrations/notionTools";
+import "./integrations/spotifyTools";
+import type { GmailToolName } from "./integrations/gmailTools";
+import type { GithubToolName } from "./integrations/githubTools";
+import type { HackatimeToolName } from "./integrations/hackatimeTools";
+import type { SpotifyToolName } from "./integrations/spotifyTools";
 
 export interface Settings {
   hotkey: string;
@@ -34,8 +45,16 @@ export type ProfileCategory = "interest" | "hobby" | "project" | "preference" | 
 export interface ProfileItem { id: string; category: ProfileCategory; text: string; confidence: number; evidenceCount: number; explicit: boolean; created: number; lastSeen: number }
 export interface ProfileOperation { category: ProfileCategory; text: string; explicit?: boolean; replaceId?: string }
 export interface CommandOutput { stdout: string; stderr: string; exit_code: number; timed_out: boolean }
+export interface CanvasProfile { id: number; name: string; shortName: string; sortableName: string; avatarUrl?: string }
+export interface CanvasCourse { id: number; name: string; courseCode: string; workflowState: string }
+export interface CanvasSubmission { workflowState?: string; submittedAt?: string; excused?: boolean }
+export interface CanvasAssignmentDate { id?: number; base?: boolean; title?: string; dueAt?: string }
+export interface CanvasAssignment { id: number; courseId: number; name: string; dueAt?: string; htmlUrl?: string; pointsPossible?: number; submission?: CanvasSubmission; allDates: CanvasAssignmentDate[] }
+export interface CanvasDueDate { assignmentId: number; courseId: number; courseName: string; name: string; dueAt: string; htmlUrl?: string }
+export interface CanvasModule { id: number; name: string; position: number; unlockAt?: string; state?: string }
+export interface CanvasModuleItem { id: number; title: string; itemType: string; position: number; htmlUrl?: string; contentId?: number; url?: string; externalUrl?: string; completionRequirement?: unknown; contentDetails?: unknown }
 
-export type ToolName = "search_web" | "rag_search" | "rag_ingest_text" | "rag_ingest_file" | "rag_list" | "rag_forget" | "calendar_list_calendars" | "calendar_list_events" | "calendar_create_event" | "calendar_update_event" | "calendar_delete_event" | "calendar_quick_add" | "list_processes" | "system_stats" | "listening_ports" | "kill_process" | "run_command";
+export type ToolName = "search_web" | "rag_search" | "rag_ingest_text" | "rag_ingest_file" | "rag_list" | "rag_forget" | "calendar_list_calendars" | "calendar_list_events" | "calendar_create_event" | "calendar_update_event" | "calendar_delete_event" | "calendar_quick_add" | "canvas_get_profile" | "canvas_list_active_courses" | "canvas_list_assignments" | "canvas_list_due_dates" | "canvas_list_modules" | "canvas_list_module_items" | "list_processes" | "system_stats" | "listening_ports" | "kill_process" | "run_command" | SpotifyToolName | HackatimeToolName | GithubToolName | GmailToolName;
 export interface ToolCall { id: string; type: "function"; function: { name: ToolName | string; arguments: string } }
 export interface ToolActivity { id: string; callId: string; name: string; args: unknown; protected: boolean; status: "waiting" | "running" | "success" | "denied" | "error"; message?: string; startedAt: number; finishedAt?: number }
 export interface ConfirmationRequest { id: string; tool: ToolName; args: unknown; summary: string }
@@ -67,19 +86,32 @@ export const TOOL_DEFINITIONS: Array<{ type: "function"; function: { name: strin
   ["calendar_update_event", "Update a calendar event. Pass start and end as strings, never as dateTime/date objects or JSON strings.", objectSchema({ eventId: str("Event id"), event: eventSchema("Partial structured event fields"), calendarId: str("Calendar id") }, ["eventId", "event"])],
   ["calendar_delete_event", "Delete a calendar event.", objectSchema({ eventId: str("Event id"), calendarId: str("Calendar id") }, ["eventId"])],
   ["calendar_quick_add", "Create an event from natural language.", objectSchema({ text: str("Event description"), calendarId: str("Calendar id") }, ["text"])],
+  ["canvas_get_profile", "Get the current Canvas user profile.", objectSchema({})],
+  ["canvas_list_active_courses", "List active Canvas courses.", objectSchema({ maxItems: num("Maximum courses, 1-100") })],
+  ["canvas_list_assignments", "List assignments for a Canvas course.", objectSchema({ courseId: num("Canvas course id"), maxItems: num("Maximum assignments, 1-100") }, ["courseId"])],
+  ["canvas_list_due_dates", "List upcoming and overdue uncompleted work across active Canvas courses.", objectSchema({ maxItems: num("Maximum due dates, 1-100") })],
+  ["canvas_list_modules", "List modules for a Canvas course.", objectSchema({ courseId: num("Canvas course id"), maxItems: num("Maximum modules, 1-100") }, ["courseId"])],
+  ["canvas_list_module_items", "List items in a Canvas course module.", objectSchema({ courseId: num("Canvas course id"), moduleId: num("Canvas module id"), maxItems: num("Maximum module items, 1-100") }, ["courseId", "moduleId"])],
   ["list_processes", "List running processes.", objectSchema({ query: { type: "object", properties: { filter: str("Name or command filter"), sort_by: str("cpu, memory, name, or pid"), limit: num("Maximum rows") } } })],
   ["system_stats", "Read system CPU and memory statistics.", objectSchema({})],
   ["listening_ports", "List local listening network ports.", objectSchema({})],
   ["kill_process", "Force stop a process.", objectSchema({ pid: num("Process id") }, ["pid"])],
   ["run_command", "Run a shell command and capture output.", objectSchema({ command: str("Shell command"), cwd: str("Working directory"), timeoutSecs: num("Timeout seconds") }, ["command"])],
-] as Array<[string, string, Record<string, unknown>]>).map(([name, description, parameters]) => ({ type: "function" as const, function: { name, description, parameters } }));
+] as Array<[string, string, Record<string, unknown>]>).map(([name, description, parameters]) => ({ type: "function" as const, function: { name, description, parameters } })).concat(integrationDefinitions());
 
 export const REQUIRES_CONFIRMATION = new Set<ToolName>([
   "kill_process", "run_command", "calendar_create_event", "calendar_update_event",
   "calendar_delete_event", "calendar_quick_add", "rag_forget", "rag_ingest_text", "rag_ingest_file",
+  ...integrationProtectedTools() as ToolName[],
 ]);
 
+export function requiresConfirmation(name: ToolName | string, args: Record<string, unknown>): boolean {
+  return REQUIRES_CONFIRMATION.has(name as ToolName) || integrationRequiresConfirmation(name, args);
+}
+
 export function confirmationSummary(name: ToolName, args: Record<string, unknown>): string {
+  const integration = integrationToolSummary(name, args);
+  if (integration) return integration;
   const target = name === "kill_process" ? `PID ${String(args.pid)}`
     : name === "run_command" ? String(args.command)
     : name === "rag_ingest_file" ? String(args.path)
@@ -108,9 +140,16 @@ function calendarEvent(value: unknown): Record<string, unknown> {
   return { ...row, start: time(row.start), end: time(row.end) };
 }
 function optionalNumber(v: unknown): number | undefined { return typeof v === "number" && Number.isFinite(v) ? v : undefined; }
+function positiveInt(v: unknown, name: string): number { const n = Number(v); if (!Number.isSafeInteger(n) || n <= 0) throw new Error(`${name} must be a positive integer.`); return n; }
+function maxItems(v: unknown): number { const n = Number(v ?? 50); return Number.isFinite(n) ? Math.max(1, Math.min(100, Math.trunc(n))) : 50; }
 export async function executeTool(name: ToolName, rawArgs: unknown, signal?: AbortSignal): Promise<unknown> {
   ensureActive(signal);
   const a = asArgs(rawArgs);
+  if (hasIntegrationTool(name)) {
+    const result = await executeIntegrationTool(name, a);
+    ensureActive(signal);
+    return result;
+  }
   let result: unknown;
   switch (name) {
     case "search_web": result = await searchWeb(String(a.query ?? ""), optionalNumber(a.limit), signal); break;
@@ -125,6 +164,12 @@ export async function executeTool(name: ToolName, rawArgs: unknown, signal?: Abo
     case "calendar_update_event": result = await invoke<CalEvent>(name, { eventId: String(a.eventId ?? ""), event: calendarEvent(a.event), calendarId: optionalString(a.calendarId) }); break;
     case "calendar_delete_event": result = await invoke<string>(name, { eventId: String(a.eventId ?? ""), calendarId: optionalString(a.calendarId) }); break;
     case "calendar_quick_add": result = await invoke<CalEvent>(name, { text: String(a.text ?? ""), calendarId: optionalString(a.calendarId) }); break;
+    case "canvas_get_profile": result = await invoke<CanvasProfile>(name); break;
+    case "canvas_list_active_courses": result = await invoke<CanvasCourse[]>(name, { maxItems: maxItems(a.maxItems) }); break;
+    case "canvas_list_assignments": result = await invoke<CanvasAssignment[]>(name, { courseId: positiveInt(a.courseId, "courseId"), maxItems: maxItems(a.maxItems) }); break;
+    case "canvas_list_due_dates": result = await invoke<CanvasDueDate[]>(name, { maxItems: maxItems(a.maxItems) }); break;
+    case "canvas_list_modules": result = await invoke<CanvasModule[]>(name, { courseId: positiveInt(a.courseId, "courseId"), maxItems: maxItems(a.maxItems) }); break;
+    case "canvas_list_module_items": result = await invoke<CanvasModuleItem[]>(name, { courseId: positiveInt(a.courseId, "courseId"), moduleId: positiveInt(a.moduleId, "moduleId"), maxItems: maxItems(a.maxItems) }); break;
     case "list_processes": result = await invoke<ProcessInfo[]>(name, { query: a.query }); break;
     case "system_stats": result = await invoke<SystemStats>(name); break;
     case "listening_ports": result = await invoke<PortInfo[]>(name); break;

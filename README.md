@@ -12,6 +12,7 @@ Theta is a Windows-focused desktop voice assistant built with React, TypeScript,
 - **Local memory:** embedding-free retrieval using BM25, character trigrams, rank fusion, and recency.
 - **Adaptive profile:** an editable “About me” profile learns interests, hobbies, projects, preferences, and recurring topics.
 - **Google Calendar:** list calendars and events, create/update/delete events, and natural-language quick add.
+- **Canvas LMS:** connect an institution account with a personal access token and read profiles, active courses, assignments, due dates, modules, and module items.
 - **System tools:** inspect processes, system statistics, and listening ports; protected tools can stop processes or run commands.
 - **Desktop integration:** global hotkey, tray behaviour, optional autostart, and close-to-tray.
 - **Safety controls:** write/destructive tools request confirmation by default; auto-approve is explicit and disabled by default.
@@ -44,7 +45,7 @@ The React frontend owns the application shell, conversation state, OpenRouter ag
 
 ### Rust backend (`src-tauri/`)
 
-The Tauri backend owns microphone capture and Vosk recognition, system/process inspection, local RAG and profile persistence, settings, Google OAuth and Calendar API calls, global shortcuts, tray behaviour, and autostart.
+The Tauri backend owns microphone capture and Vosk recognition, system/process inspection, local RAG and profile persistence, settings, Google OAuth and Calendar API calls, Canvas LMS authentication and API calls, global shortcuts, tray behaviour, and autostart.
 
 ## Local and remote processing
 
@@ -55,6 +56,7 @@ The Tauri backend owns microphone capture and Vosk recognition, system/process i
 | Agent reasoning | OpenRouter | User message, conversation context, selected memory/profile context, and tool results |
 | Web search | Firecrawl | Search query |
 | Google Calendar | Google APIs | OAuth data and requested Calendar content |
+| Canvas LMS | Configured institution Canvas API | Personal access token and requested profile/coursework data; returned data may subsequently be sent to OpenRouter as tool results |
 | Neural speech | Unofficial Edge Read Aloud endpoint | Reply text and selected voice |
 | System voice fallback | WebView/operating system | Depends on the installed voice provider |
 | System/process inspection | Local | Results may be returned to the agent as tool output |
@@ -218,6 +220,27 @@ Theta binds an ephemeral loopback listener on `127.0.0.1` and supplies that gene
 
 Google client configuration, refresh/access tokens, expiry, and account email are persisted in `google_auth.json` under Theta's platform app-data directory. This is local JSON storage, not demonstrated operating-system credential-vault encryption. Use **Disconnect** to remove the saved Google authentication state.
 
+## Canvas LMS setup
+
+Theta's Canvas integration is read-only. The React agent exposes Canvas tools, while the Rust backend validates the connection, stores authentication, sends HTTPS requests directly to the configured institution, follows Canvas pagination, and returns bounded results to the agent.
+
+1. Sign in to your institution's Canvas website in a browser.
+2. Open **Account → Settings**. Under **Approved Integrations**, select **New Access Token**. Institutions can rename, restrict, or disable personal access tokens; if the control is absent, contact your Canvas administrator.
+3. Give the token a purpose and, if offered, an expiry date. Generate it, copy it immediately, and keep it private; Canvas may not show it again.
+4. In Theta, open **Settings → Canvas LMS**.
+5. Enter the institution root URL, for example `https://canvas.example.edu`. Use only the HTTPS origin shown before `/courses`, `/profile`, or `/login`; do not include an API path, credentials, query string, or fragment.
+6. Paste the personal access token and select **Save connection**. Theta verifies it by requesting the current Canvas profile before saving it.
+
+Never commit or share a real token or private institution URL. Theta sends the token only as a bearer credential to the configured Canvas HTTPS origin. API pagination links are accepted only when they remain on that same origin.
+
+The available agent tools can get the current profile and list active courses, assignments, due dates across active courses, modules, and module items. They do not create, edit, submit, grade, enroll, or delete Canvas data, so they require no protected-action confirmation. Canvas responses become agent tool results and may be included in requests to the selected OpenRouter model. Course names, assignment details, due dates, module names/items, profile fields, and links can therefore leave the device; do not use the tools with data you are not permitted to send to OpenRouter.
+
+Canvas list endpoints request up to 100 records per page and follow the API's `Link` headers. Backend safety limits stop a request after 50 pages or before exceeding 5,000 accumulated records; due-date aggregation additionally refuses more than 25 active courses. Reaching a backend cap produces an error rather than silently returning an incomplete result.
+
+Authentication/configuration is persisted in `canvas_auth.json` under Theta's platform app-data directory. It contains the institution root URL and personal access token in plaintext JSON, not operating-system credential-vault encryption. Anyone or any process able to read that app-data file can recover the token. Use a short-lived, least-privilege token where the institution supports one, protect the Windows account, and do not copy this file into backups or support reports.
+
+Errors are deliberately concise: invalid roots/tokens, disconnected state, rejected credentials, missing resources, rate limits, timeouts, unreachable service, invalid responses, unsafe pagination, and safety-cap exhaustion are reported without echoing the token or Canvas response body. For more detail, check Theta's Debug view and the institution's Canvas service status. If credentials are rejected, revoke the old token in Canvas, generate a replacement, and save the root URL with the new token. Saving a verified replacement rotates the stored token. **Disconnect** removes `canvas_auth.json` and clears the in-memory connection, but it does not revoke the token at Canvas; revoke it in **Account → Settings → Approved Integrations** as well when retiring or suspecting exposure.
+
 ## Speech
 
 ### Recognition
@@ -237,6 +260,7 @@ Theta connects directly to the unofficial Edge Read Aloud WebSocket, builds vali
 | Local memory writes | Ingest text/file, forget memory | Yes |
 | Calendar reads | List calendars/events | No |
 | Calendar writes | Create, update, delete, quick add | Yes |
+| Canvas reads | Profile, active courses, assignments, due dates, modules, module items | No |
 | System inspection | Statistics, process list, listening ports | No |
 | System mutation | Kill process, run command | Yes |
 
@@ -263,6 +287,9 @@ Theta uses Tauri's per-user platform app-data directory. On Windows this is reso
 | `profile.json` | Learnt About Me facts and evidence metadata |
 | `rag.json` | Indexed local-memory chunks and metadata |
 | `google_auth.json` | Google OAuth client configuration and tokens |
+| `canvas_auth.json` | Canvas institution root URL and personal access token |
+
+These app-data JSON files are ordinary plaintext files; the current implementation does not encrypt them with Windows DPAPI or store secrets in an operating-system credential vault.
 
 Conversation transcript state is maintained in the running frontend and is not written by the current hook to a transcript file. Closing/restarting Theta clears that conversation context.
 
@@ -281,6 +308,7 @@ To reset specific data, use the corresponding UI actions: clear About Me, forget
 ├── src-tauri/
 │   ├── src/
 │   │   ├── calendar.rs        # Google OAuth and Calendar API
+│   │   ├── canvas.rs          # Canvas authentication and read-only API
 │   │   ├── procs.rs           # Process/system/port tools
 │   │   ├── profile.rs         # Structured About Me persistence
 │   │   ├── rag.rs             # Local retrieval and storage
@@ -339,6 +367,10 @@ Use a Google OAuth client of type **Desktop app**. Theta intentionally uses a fr
 
 Current code sends an explicit zero content length for bodyless Quick Add POSTs. Structured event tools normalize JSON-string events and Google-style `{ "dateTime": "…" }`/`{ "date": "…" }` nodes. Rebuild/restart Theta if an older running backend still reports these errors.
 
+### Canvas will not connect or stops listing data
+
+Enter the institution's root HTTPS origin rather than a course or API URL, then verify that the personal access token is current and permitted by the institution. `401`/`403` responses are shown as rejected credentials; revoke and replace the token rather than repeatedly saving it. Rate limits, timeouts, malformed responses, cross-origin pagination, and page/item safety caps are surfaced as explicit errors. Disconnecting locally does not revoke the token in Canvas.
+
 ### Edge speech falls back to a robotic/system voice
 
 Open Debug and inspect the latest speech diagnostic. Common causes include network filtering, an expired protocol/token, invalid voice configuration, or Microsoft changing the unofficial endpoint. The fallback is expected resilience behaviour, not a local neural model.
@@ -351,7 +383,8 @@ The running Tauri backend must be restarted after Rust changes. Frontend environ
 
 - `VITE_OPENROUTER_API_KEY`, `VITE_FIRECRAWL_KEY`, and any other `VITE_*` values are embedded in distributable frontend assets. Do not treat them as confidential.
 - OpenRouter calls currently originate from frontend JavaScript with `dangerouslyAllowBrowser: true`; production deployments should proxy privileged credentials through a controlled backend.
-- OAuth tokens are stored in a local JSON file rather than a demonstrated OS credential vault.
+- OAuth tokens and the Canvas personal access token are stored in local JSON files rather than a demonstrated OS credential vault.
+- Canvas requests go directly to the configured institution over HTTPS; Canvas tool results may be sent to OpenRouter as agent context.
 - The Google integration requests broad Calendar access for read/write tools.
 - Auto-approve can authorize shell execution, process termination, Calendar writes, and memory modifications without per-action review.
 - Ingesting a file sends its path to the Rust backend and may later expose retrieved excerpts to the model as context.
@@ -368,6 +401,8 @@ If any real credential has been committed, logged, bundled, or shared, rotate it
 - Edge neural speech depends on an unofficial protocol.
 - Speech finals are submitted as produced by Vosk; short fragmented utterances can become separate requests.
 - Conversation history is session-local rather than durable.
+- Google OAuth and Canvas credentials are plaintext in the per-user app-data directory rather than protected by an OS credential vault.
+- Canvas access is read-only and bounded by pagination, item, and active-course aggregation limits.
 - The UI and agent implementation are still relatively monolithic and under active development.
 - Packaging must account for the Vosk model and native libraries; verify release bundles on a clean machine.
 

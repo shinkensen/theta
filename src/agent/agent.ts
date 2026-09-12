@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import { invoke } from "@tauri-apps/api/core";
 import type { ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
-import { confirmationSummary, executeTool, isToolName, REQUIRES_CONFIRMATION, TOOL_DEFINITIONS, type ConfirmTool, type ProfileItem, type RagHit, type Settings, type ToolActivity } from "./tools";
+import { confirmationSummary, executeTool, isToolName, requiresConfirmation, TOOL_DEFINITIONS, type ConfirmTool, type ProfileItem, type RagHit, type Settings, type ToolActivity } from "./tools";
 
 export type AgentMessage = ChatCompletionMessageParam;
 export interface RunAgentOptions {
@@ -97,7 +97,7 @@ export async function runAgent(userText: string, options: RunAgentOptions): Prom
       try {
         const args = JSON.parse(call.type === "function" ? call.function.arguments : "{}") as Record<string, unknown>;
         if (!isToolName(rawName)) return { call, error: `Tool error: unknown tool '${rawName}'.` };
-        const protectedAction = REQUIRES_CONFIRMATION.has(rawName);
+        const protectedAction = requiresConfirmation(rawName, args);
         const needsConfirmation = protectedAction && !settings.autoApprove;
         const activity: ToolActivity = { id: `${call.id}-${startedAt}`, callId: call.id, name: rawName, args, protected: protectedAction, status: needsConfirmation ? "waiting" : "running", startedAt };
         onActivity?.(activity);
@@ -110,7 +110,7 @@ export async function runAgent(userText: string, options: RunAgentOptions): Prom
       if (item.error || !item.name || !item.args || !item.activity) return { id: item.call.id, content: item.error ?? "Tool error." };
       const { name, args, activity } = item;
       try {
-        if (REQUIRES_CONFIRMATION.has(name) && !settings.autoApprove) {
+        if (requiresConfirmation(name, args) && !settings.autoApprove) {
           const approved = await confirm({ id: item.call.id, tool: name, args, summary: confirmationSummary(name, args) });
           if (!approved) {
             onActivity?.({ ...activity, status: "denied", message: "Denied by user", finishedAt: Date.now() });
@@ -128,9 +128,9 @@ export async function runAgent(userText: string, options: RunAgentOptions): Prom
       }
     };
     const outcomes = new Map<string, { id: string; content: string }>();
-    const safe = prepared.filter((item) => !item.name || !REQUIRES_CONFIRMATION.has(item.name) || settings.autoApprove);
+    const safe = prepared.filter((item) => !item.name || !item.args || !requiresConfirmation(item.name, item.args) || settings.autoApprove);
     (await Promise.all(safe.map(execute))).forEach((outcome) => outcomes.set(outcome.id, outcome));
-    for (const item of prepared.filter((candidate) => candidate.name && REQUIRES_CONFIRMATION.has(candidate.name) && !settings.autoApprove)) {
+    for (const item of prepared.filter((candidate) => candidate.name && candidate.args && requiresConfirmation(candidate.name, candidate.args) && !settings.autoApprove)) {
       const outcome = await execute(item);
       outcomes.set(outcome.id, outcome);
     }

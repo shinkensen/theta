@@ -342,10 +342,11 @@ fn chunk_text(text: &str) -> Vec<String> {
             // Look back over the last third for a clean break.
             let window_start = start + (CHUNK_CHARS * 2 / 3);
             let slice = &chars[window_start..hard_end];
-            let break_at = slice
-                .iter()
-                .rposition(|&c| c == '\n')
-                .or_else(|| slice.iter().rposition(|&c| c == '.' || c == '!' || c == '?'));
+            let break_at = slice.iter().rposition(|&c| c == '\n').or_else(|| {
+                slice
+                    .iter()
+                    .rposition(|&c| c == '.' || c == '!' || c == '?')
+            });
             if let Some(offset) = break_at {
                 end = window_start + offset + 1;
             }
@@ -392,7 +393,10 @@ pub fn rag_ingest_text(
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| {
             // Fall back to the first line, clipped.
-            let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("note");
+            let first = text
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("note");
             first.chars().take(60).collect()
         });
     let source = source.unwrap_or_else(|| "note".to_string());
@@ -460,7 +464,13 @@ pub fn rag_ingest_file(
         }
     }
 
-    rag_ingest_text(text, Some(title), Some(path), Some(vec!["file".into()]), state)
+    rag_ingest_text(
+        text,
+        Some(title),
+        Some(path),
+        Some(vec!["file".into()]),
+        state,
+    )
 }
 
 #[derive(Serialize)]

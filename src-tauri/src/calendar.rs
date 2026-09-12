@@ -217,7 +217,9 @@ pub fn google_set_credentials(
 
     state.update(|a| {
         a.client_id = Some(client_id);
-        a.client_secret = client_secret.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        a.client_secret = client_secret
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         if changed {
             a.refresh_token = None;
             a.access_token = None;
@@ -334,16 +336,14 @@ pub async fn google_connect(
     state: tauri::State<'_, CalendarState>,
 ) -> Result<String, String> {
     let auth = state.snapshot()?;
-    let client_id = auth.client_id.clone().ok_or(
-        "No OAuth client ID saved yet. Paste one in Settings → Google Calendar first.",
-    )?;
+    let client_id = auth
+        .client_id
+        .clone()
+        .ok_or("No OAuth client ID saved yet. Paste one in Settings → Google Calendar first.")?;
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .map_err(|e| format!("Couldn't open a loopback port for the OAuth redirect: {e}"))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| e.to_string())?
-        .port();
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}");
 
     let (verifier, challenge) = pkce_pair();
@@ -371,10 +371,11 @@ pub async fn google_connect(
     let _ = app;
 
     let expected_csrf = csrf.clone();
-    let callback =
-        tauri::async_runtime::spawn_blocking(move || await_callback(&listener, CONSENT_TIMEOUT_SECS))
-            .await
-            .map_err(|e| format!("OAuth wait task failed: {e}"))??;
+    let callback = tauri::async_runtime::spawn_blocking(move || {
+        await_callback(&listener, CONSENT_TIMEOUT_SECS)
+    })
+    .await
+    .map_err(|e| format!("OAuth wait task failed: {e}"))??;
 
     if let Some(err) = callback.error {
         return Err(format!("Google sign-in was denied: {err}"));
@@ -452,10 +453,7 @@ fn email_from_id_token(id_token: &str) -> Option<String> {
         .decode(payload)
         .ok()?;
     let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    claims
-        .get("email")?
-        .as_str()
-        .map(|s| s.to_string())
+    claims.get("email")?.as_str().map(|s| s.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -624,10 +622,7 @@ pub async fn calendar_list_calendars(
                             .and_then(|v| v.as_str())
                             .unwrap_or("(unnamed)")
                             .to_string(),
-                        primary: c
-                            .get("primary")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false),
+                        primary: c.get("primary").and_then(|v| v.as_bool()).unwrap_or(false),
                         access_role: c
                             .get("accessRole")
                             .and_then(|v| v.as_str())
@@ -688,9 +683,10 @@ pub async fn calendar_list_events(
 ///
 /// * `None`             → now (or now + 7 days when `end_of_day`)
 /// * `YYYY-MM-DD`       → local midnight, or 23:59:59 local when `end_of_day`
-/// * anything else      → passed through, assumed already RFC 3339
+/// * RFC 3339           → parsed and normalized
+/// * offsetless date-time → interpreted in the machine's local timezone
 fn to_rfc3339(value: Option<&str>, end_of_day: bool) -> Result<String, String> {
-    use chrono::{Local, NaiveDate, TimeZone};
+    use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone};
 
     let Some(raw) = value.map(str::trim).filter(|s| !s.is_empty()) else {
         let now = chrono::Utc::now();
@@ -716,7 +712,22 @@ fn to_rfc3339(value: Option<&str>, end_of_day: bool) -> Result<String, String> {
             .ok_or_else(|| format!("'{raw}' is ambiguous in the local timezone."));
     }
 
-    Ok(raw.to_string())
+    if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
+        return Ok(dt.to_rfc3339());
+    }
+    for format in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(raw, format) {
+            return Local
+                .from_local_datetime(&naive)
+                .earliest()
+                .map(|dt| dt.to_rfc3339())
+                .ok_or_else(|| format!("'{raw}' is ambiguous in the local timezone."));
+        }
+    }
+
+    Err(format!(
+        "'{raw}' isn't a valid calendar time (use YYYY-MM-DD or RFC 3339)."
+    ))
 }
 
 /// What the UI and the LLM send when creating or editing an event.
@@ -812,7 +823,12 @@ fn default_end(start: &serde_json::Value, all_day: bool) -> Result<serde_json::V
 fn event_body(input: &EventInput, require_start: bool) -> Result<serde_json::Value, String> {
     let mut body = serde_json::Map::new();
 
-    if let Some(s) = input.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(s) = input
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         body.insert("summary".into(), s.into());
     } else if require_start {
         body.insert("summary".into(), "(untitled)".into());
@@ -838,10 +854,20 @@ fn event_body(input: &EventInput, require_start: bool) -> Result<serde_json::Val
         );
     }
 
-    match input.start.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    match input
+        .start
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(raw) => {
             let start = event_time(raw, input.all_day)?;
-            let end = match input.end.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let end = match input
+                .end
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 Some(e) => event_time(e, input.all_day)?,
                 None => default_end(&start, input.all_day)?,
             };
@@ -853,7 +879,12 @@ fn event_body(input: &EventInput, require_start: bool) -> Result<serde_json::Val
         }
         None => {
             // A patch that only moves the end time is legitimate.
-            if let Some(e) = input.end.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(e) = input
+                .end
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 body.insert("end".into(), event_time(e, input.all_day)?);
             }
         }
@@ -1026,6 +1057,13 @@ mod tests {
         assert!(event_body(&input, false).unwrap()["location"] == "Room 2");
         // …but a create can't.
         assert!(event_body(&input, true).is_err());
+    }
+
+    #[test]
+    fn list_times_reject_invalid_and_normalize_offsetless_values() {
+        let local = to_rfc3339(Some("2026-03-04T14:30"), false).unwrap();
+        assert!(chrono::DateTime::parse_from_rfc3339(&local).is_ok());
+        assert!(to_rfc3339(Some("tomorrow morning"), false).is_err());
     }
 
     #[test]

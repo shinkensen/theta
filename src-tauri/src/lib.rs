@@ -18,6 +18,8 @@
 //! the window has focus, which defeats the point.
 
 pub mod calendar;
+pub mod canvas;
+pub mod integrations;
 pub mod procs;
 pub mod profile;
 pub mod rag;
@@ -310,12 +312,12 @@ pub fn run() {
         .setup(|app| {
             // RAG and OAuth tokens are per-user state, so they live in the
             // platform app-data dir rather than next to the binary.
-            let data_dir = app.path().app_data_dir().map_err(|e| {
-                format!("Couldn't resolve the app data directory: {e}")
-            })?;
-            std::fs::create_dir_all(&data_dir).map_err(|e| {
-                format!("Couldn't create {}: {e}", data_dir.display())
-            })?;
+            let data_dir = app
+                .path()
+                .app_data_dir()
+                .map_err(|e| format!("Couldn't resolve the app data directory: {e}"))?;
+            std::fs::create_dir_all(&data_dir)
+                .map_err(|e| format!("Couldn't create {}: {e}", data_dir.display()))?;
 
             let settings = settings::SettingsState::load(&data_dir);
             let hotkey = settings.snapshot().hotkey;
@@ -323,6 +325,13 @@ pub fn run() {
             app.manage(rag::RagState::load(&data_dir));
             app.manage(profile::ProfileState::load(&data_dir));
             app.manage(calendar::CalendarState::load(&data_dir));
+            app.manage(canvas::CanvasState::load(&data_dir));
+            app.manage(integrations::spotify::SpotifyState::load(&data_dir));
+            app.manage(integrations::hackatime::HackatimeState::load(&data_dir));
+            app.manage(integrations::github::GithubState::load(&data_dir));
+            app.manage(integrations::gmail::GmailState::load(&data_dir));
+            app.manage(integrations::notion::NotionState::load(&data_dir));
+            app.manage(integrations::minestrator::MineStratorState::load(&data_dir));
             app.manage(settings);
 
             let handle = app.handle();
@@ -400,6 +409,76 @@ pub fn run() {
             calendar::calendar_update_event,
             calendar::calendar_delete_event,
             calendar::calendar_quick_add,
+            // Canvas LMS
+            canvas::canvas_status,
+            canvas::canvas_save_config,
+            canvas::canvas_disconnect,
+            canvas::canvas_get_profile,
+            canvas::canvas_list_active_courses,
+            canvas::canvas_list_assignments,
+            canvas::canvas_list_due_dates,
+            canvas::canvas_list_modules,
+            canvas::canvas_list_module_items,
+            // Spotify
+            integrations::spotify::spotify_status,
+            integrations::spotify::spotify_set_client_id,
+            integrations::spotify::spotify_connect,
+            integrations::spotify::spotify_disconnect,
+            integrations::spotify::spotify_get_playback,
+            integrations::spotify::spotify_list_devices,
+            integrations::spotify::spotify_play,
+            integrations::spotify::spotify_pause,
+            integrations::spotify::spotify_next,
+            integrations::spotify::spotify_previous,
+            integrations::spotify::spotify_seek,
+            integrations::spotify::spotify_set_volume,
+            // Hackatime
+            integrations::hackatime::hackatime_status,
+            integrations::hackatime::hackatime_set_client_id,
+            integrations::hackatime::hackatime_connect,
+            integrations::hackatime::hackatime_disconnect,
+            integrations::hackatime::hackatime_get_profile,
+            integrations::hackatime::hackatime_get_hours,
+            integrations::hackatime::hackatime_get_streak,
+            integrations::hackatime::hackatime_list_projects,
+            integrations::hackatime::hackatime_latest_heartbeat,
+            // GitHub
+            integrations::github::github_status,
+            integrations::github::github_set_client_id,
+            integrations::github::github_begin_device_flow,
+            integrations::github::github_poll_device_flow,
+            integrations::github::github_disconnect,
+            integrations::github::github_get_profile,
+            integrations::github::github_list_repositories,
+            integrations::github::github_list_notifications,
+            integrations::github::github_search_issues,
+            integrations::github::github_create_issue,
+            integrations::github::github_comment_issue,
+            // Gmail
+            integrations::gmail::gmail_status,
+            integrations::gmail::gmail_set_client_id,
+            integrations::gmail::gmail_connect,
+            integrations::gmail::gmail_disconnect,
+            integrations::gmail::gmail_get_profile,
+            integrations::gmail::gmail_search_messages,
+            integrations::gmail::gmail_get_message,
+            integrations::gmail::gmail_get_thread,
+            integrations::gmail::gmail_create_draft,
+            integrations::gmail::gmail_send_message,
+            integrations::gmail::gmail_modify_message,
+            // Notion hosted MCP
+            integrations::notion::notion_status,
+            integrations::notion::notion_connect,
+            integrations::notion::notion_disconnect,
+            integrations::notion::notion_list_tools,
+            integrations::notion::notion_call_tool,
+            // MineStrator hosted MCP
+            integrations::minestrator::minestrator_status,
+            integrations::minestrator::minestrator_save_config,
+            integrations::minestrator::minestrator_connect,
+            integrations::minestrator::minestrator_disconnect,
+            integrations::minestrator::minestrator_list_tools,
+            integrations::minestrator::minestrator_call_tool,
             // settings
             settings::get_settings,
             settings::save_settings,
