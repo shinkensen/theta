@@ -1,3 +1,4 @@
+pub mod api_keys;
 pub mod github;
 pub mod gmail;
 pub mod hackatime;

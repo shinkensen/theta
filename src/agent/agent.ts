@@ -14,11 +14,26 @@ export interface RunAgentOptions {
 }
 export interface AgentResult { reply: string; messages: AgentMessage[] }
 
-const client = new OpenAI({
-  baseURL: "https://openrouter.ai/api/v1",
-  apiKey: import.meta.env.VITE_OPENROUTER_API_KEY,
-  dangerouslyAllowBrowser: true,
-});
+let cachedClient: OpenAI | null = null;
+let cachedApiKey: string | null = null;
+
+async function getClient(): Promise<OpenAI> {
+  try {
+    const apiKey = await invoke<string>("openrouter_get_key");
+    if (cachedClient && cachedApiKey === apiKey) {
+      return cachedClient;
+    }
+    cachedApiKey = apiKey;
+    cachedClient = new OpenAI({
+      baseURL: "https://openrouter.ai/api/v1",
+      apiKey,
+      dangerouslyAllowBrowser: true,
+    });
+    return cachedClient;
+  } catch (error) {
+    throw new Error("OpenRouter is not configured. Please add your API key in Settings.");
+  }
+}
 
 function systemPrompt(rag: RagHit[], profile: ProfileItem[]): string {
   const now = new Date();
@@ -50,6 +65,7 @@ function isRetryable(error: unknown): boolean {
   return status === 404 || status === 408 || status === 429 || status >= 500;
 }
 async function completion(model: string, history: AgentMessage[], tools: ChatCompletionTool[], signal: AbortSignal | undefined, onDebug?: (message: string) => void) {
+  const client = await getClient();
   const request = { messages: history, tools, tool_choice: "auto" as const, parallel_tool_calls: true };
   try {
     const response = await client.chat.completions.create({ model, ...request }, { signal });
@@ -68,7 +84,7 @@ async function completion(model: string, history: AgentMessage[], tools: ChatCom
 
 export async function runAgent(userText: string, options: RunAgentOptions): Promise<AgentResult> {
   const { settings, confirm, onActivity, onDebug, signal } = options;
-  if (!import.meta.env.VITE_OPENROUTER_API_KEY) throw new Error("OpenRouter is not configured.");
+  await getClient(); 
   if (signal?.aborted) throw new DOMException("Cancelled", "AbortError");
   let rag: RagHit[] = [];
   let profile: ProfileItem[] = [];

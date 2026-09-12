@@ -2,7 +2,27 @@ import OpenAI from "openai";
 import { invoke } from "@tauri-apps/api/core";
 import type { ProfileItem, ProfileOperation } from "./tools";
 
-const client = new OpenAI({ baseURL: "https://openrouter.ai/api/v1", apiKey: import.meta.env.VITE_OPENROUTER_API_KEY, dangerouslyAllowBrowser: true });
+let cachedClient: OpenAI | null = null;
+let cachedApiKey: string | null = null;
+
+async function getClient(): Promise<OpenAI> {
+  try {
+    const apiKey = await invoke<string>("openrouter_get_key");
+    if (cachedClient && cachedApiKey === apiKey) {
+      return cachedClient;
+    }
+    cachedApiKey = apiKey;
+    cachedClient = new OpenAI({
+      baseURL: "https://openrouter.ai/api/v1",
+      apiKey,
+      dangerouslyAllowBrowser: true,
+    });
+    return cachedClient;
+  } catch (error) {
+    throw new Error("OpenRouter is not configured. Please add your API key in Settings.");
+  }
+}
+
 const CATEGORIES = new Set(["interest", "hobby", "project", "preference", "recurring_topic"]);
 
 function parseOperations(raw: string): ProfileOperation[] {
@@ -20,6 +40,7 @@ function parseOperations(raw: string): ProfileOperation[] {
 }
 
 export async function learnProfile(userText: string, assistantReply: string, current: ProfileItem[], model: string, signal?: AbortSignal): Promise<ProfileItem[]> {
+  const client = await getClient();
   const prompt = `Update a user's evolving profile from one conversation turn. Return ONLY a JSON array (maximum 8 objects) with category, text, explicit, and optional replaceId.
 Categories: interest, hobby, project, preference, recurring_topic.
 Explicit is true only when the user directly states the fact. A question alone may create a low-confidence recurring_topic, not an interest. Use replaceId only for a clearly contradicted existing item. Never infer or save credentials, exact addresses, health, religion, politics, sexuality, finances, or other sensitive traits. Keep each text short, third-person, and timeless. Return [] when nothing useful is learned.

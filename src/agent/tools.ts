@@ -183,8 +183,8 @@ export async function executeTool(name: ToolName, rawArgs: unknown, signal?: Abo
 
 interface WebResult { url: string; title?: string; description?: string; markdown?: string }
 async function searchWeb(query: string, requestedLimit = 3, signal?: AbortSignal): Promise<WebResult[]> {
-  const key = import.meta.env.VITE_FIRECRAWL_KEY;
-  if (!key) throw new Error("Web search is not configured.");
+  const key = await invoke<string>("firecrawl_get_key").catch(() => "");
+  if (!key) throw new Error("Web search is not configured. Please add your Firecrawl API key in Settings.");
   const limit = Math.max(1, Math.min(8, requestedLimit));
   const response = await fetch("https://api.firecrawl.dev/v1/search", {
     method: "POST", signal,

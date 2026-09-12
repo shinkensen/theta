@@ -332,6 +332,7 @@ pub fn run() {
             app.manage(integrations::gmail::GmailState::load(&data_dir));
             app.manage(integrations::notion::NotionState::load(&data_dir));
             app.manage(integrations::minestrator::MineStratorState::load(&data_dir));
+            app.manage(integrations::api_keys::ApiKeyState::load(&data_dir));
             app.manage(settings);
 
             let handle = app.handle();
@@ -479,6 +480,14 @@ pub fn run() {
             integrations::minestrator::minestrator_disconnect,
             integrations::minestrator::minestrator_list_tools,
             integrations::minestrator::minestrator_call_tool,
+            // OpenRouter + Firecrawl API keys
+            integrations::api_keys::openrouter_status,
+            integrations::api_keys::openrouter_save_key,
+            integrations::api_keys::openrouter_get_key,
+            integrations::api_keys::openrouter_clear_key,
+            integrations::api_keys::firecrawl_status,
+            integrations::api_keys::firecrawl_save_key,
+            integrations::api_keys::firecrawl_get_key,
             // settings
             settings::get_settings,
             settings::save_settings,

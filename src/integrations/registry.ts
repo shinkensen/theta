@@ -5,6 +5,8 @@ import { HackatimeSettingsCard } from "../components/integrations/HackatimeSetti
 import { MineStratorSettingsCard } from "../components/integrations/MineStratorSettingsCard";
 import { NotionSettingsCard } from "../components/integrations/NotionSettingsCard";
 import { SpotifySettingsCard } from "../components/integrations/SpotifySettingsCard";
+import { OpenRouterSettingsCard } from "../components/integrations/OpenRouterSettingsCard";
+import { FirecrawlSettingsCard } from "../components/integrations/FirecrawlSettingsCard";
 
 export interface IntegrationCardRegistration {
   id: string;
@@ -12,6 +14,8 @@ export interface IntegrationCardRegistration {
 }
 
 const cards: IntegrationCardRegistration[] = [
+  { id: "openrouter", component: OpenRouterSettingsCard },
+  { id: "firecrawl", component: FirecrawlSettingsCard },
   { id: "spotify", component: SpotifySettingsCard },
   { id: "hackatime", component: HackatimeSettingsCard },
   { id: "github", component: GitHubSettingsCard },

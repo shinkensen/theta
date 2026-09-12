@@ -29,9 +29,9 @@ export function SpotifySettingsCard() {
     try { await spotify.disconnect(); setMessage("Spotify disconnected."); await refresh(); }
     catch (reason) { setError(String(reason)); }
   };
-  const copyRedirect = () => void navigator.clipboard.writeText(status?.redirectUri ?? "http://127.0.0.1/callback");
+  const copyRedirect = () => void navigator.clipboard.writeText(status?.redirectUri ?? "http://127.0.0.1:8754/callback");
   return <IntegrationCard name="Spotify" category="MUSIC" description="Control the active Spotify player from Theta. Spotify Premium and an active device may be required." connected={status?.connected} configured={status?.configured} loading={loading} className="spotify-card" error={error} message={message} accountLabel={status?.accountLabel} onSubmit={save}>
-    <label>OAuth redirect URI<div className="inline-field"><input readOnly value={status?.redirectUri ?? "http://127.0.0.1/callback"} /><button type="button" onClick={copyRedirect}>Copy</button></div><small>Register this URI in your Spotify developer app. Dynamic loopback ports are added during sign-in.</small></label>
+    <label>OAuth redirect URI<div className="inline-field"><input readOnly value={status?.redirectUri ?? "http://127.0.0.1:8754/callback"} /><button type="button" onClick={copyRedirect}>Copy</button></div></label>
     <CredentialField label="Spotify Client ID" value={clientId} onChange={setClientId} placeholder={status?.configured ? "Enter a new ID to replace it" : "Paste Client ID"} required={!status?.configured} />
     <div className="button-row"><button disabled={loading || !clientId.trim()}>Save Client ID</button><button type="button" className="primary" disabled={loading || !status?.configured} onClick={() => void connect()}>Connect</button>{status?.connected && <button type="button" className="danger" onClick={() => void disconnect()}>Disconnect</button>}</div>
   </IntegrationCard>;
