@@ -32,11 +32,11 @@ export function IntegrationCard({
   const state = loading ? "Checking…" : connected ? "Connected" : configured ? "Ready" : "Not connected";
   return <form className={`card form-stack integration-card ${className}`.trim()} onSubmit={onSubmit} aria-busy={loading}>
     <div className="integration-head">
-      <div><span className="card-kicker">{category}</span><h2>{name}</h2></div>
+      <div><span className="card-kicker">{}</span><h2>{name}</h2></div>
       <span className={`connection-badge ${connected ? "connected" : ""}`}>{state}</span>
     </div>
     <p className="muted">{description}</p>
-    {children}
+    {category? children :children}
     {accountLabel && <p className="muted">Signed in as {accountLabel}.</p>}
     {error && <p className="integration-error" role="alert">{error}</p>}
     {message && !error && <p className="integration-message" role="status">{message}</p>}
@@ -51,8 +51,10 @@ interface CredentialFieldProps {
   required?: boolean;
   secret?: boolean;
   help?: string;
+  type?: string;
 }
 
-export function CredentialField({ label, value, onChange, placeholder, required, secret = false, help }: CredentialFieldProps) {
-  return <label>{label}<input type={secret ? "password" : "text"} value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} autoComplete={secret ? "new-password" : "off"} required={required} />{help && <small>{help}</small>}</label>;
+export function CredentialField({ label, value, onChange, placeholder, required, secret = false, help, type }: CredentialFieldProps) {
+  const inputType = type || (secret ? "password" : "text");
+  return <label>{label}<input type={inputType} value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} autoComplete={secret || type === "password" ? "new-password" : "off"} required={required} />{help && <small>{help}</small>}</label>;
 }

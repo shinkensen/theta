@@ -20,6 +20,7 @@ const MODIFY_SCOPE: &str = "https://www.googleapis.com/auth/gmail.modify";
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct GmailAuth {
     client_id: Option<String>,
+    client_secret: Option<String>,
     refresh_token: Option<String>,
     access_token: Option<String>,
     expires_at: Option<i64>,
@@ -67,14 +68,18 @@ impl GmailState {
         }
         let client = a.client_id.ok_or("Gmail is not configured")?;
         let refresh = a.refresh_token.ok_or("Gmail is not connected")?;
+        let mut form = vec![
+            ("client_id", client.as_str()),
+            ("refresh_token", refresh.as_str()),
+            ("grant_type", "refresh_token"),
+        ];
+        if let Some(secret) = a.client_secret.as_deref().filter(|s| !s.is_empty()) {
+            form.push(("client_secret", secret));
+        }
         let response = self
             .http
             .post(TOKEN_ENDPOINT)
-            .form(&[
-                ("client_id", client.as_str()),
-                ("refresh_token", refresh.as_str()),
-                ("grant_type", "refresh_token"),
-            ])
+            .form(&form)
             .send()
             .await
             .map_err(|e| format!("Gmail token refresh failed: {e}"))?;
@@ -145,6 +150,7 @@ pub fn gmail_status(state: tauri::State<'_, GmailState>) -> Result<IntegrationSt
 #[tauri::command]
 pub fn gmail_set_client_id(
     client_id: String,
+    client_secret: Option<String>,
     state: tauri::State<'_, GmailState>,
 ) -> Result<(), String> {
     let id = client_id.trim();
@@ -154,6 +160,9 @@ pub fn gmail_set_client_id(
     let changed = state.snapshot()?.client_id.as_deref() != Some(id);
     state.update(|a| {
         a.client_id = Some(id.into());
+        a.client_secret = client_secret
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         if changed {
             a.refresh_token = None;
             a.access_token = None;
@@ -207,16 +216,23 @@ pub async fn gmail_connect(
     let code = callback
         .code
         .ok_or("Google did not return an authorization code")?;
+    
+    let auth = state.snapshot()?;
+    let mut form = vec![
+        ("client_id", client.as_str()),
+        ("code", code.as_str()),
+        ("redirect_uri", redirect.as_str()),
+        ("grant_type", "authorization_code"),
+        ("code_verifier", verifier.as_str()),
+    ];
+    if let Some(secret) = auth.client_secret.as_deref().filter(|s| !s.is_empty()) {
+        form.push(("client_secret", secret));
+    }
+    
     let response = state
         .http
         .post(TOKEN_ENDPOINT)
-        .form(&[
-            ("client_id", client.as_str()),
-            ("code", code.as_str()),
-            ("redirect_uri", redirect.as_str()),
-            ("grant_type", "authorization_code"),
-            ("code_verifier", verifier.as_str()),
-        ])
+        .form(&form)
         .send()
         .await
         .map_err(|e| format!("Gmail token exchange failed: {e}"))?;

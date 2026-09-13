@@ -1,23 +1,38 @@
-//! Local speech-to-text on top of Vosk + cpal.
+//! Speech-to-text lifecycle, shared by every recognition backend.
 //!
-//! Captures from the default input device in whatever native format it
-//! offers, down-mixes to mono, linearly resamples to the 16 kHz Vosk wants,
-//! and streams partial/final transcripts to the frontend as Tauri events.
+//! Capture and recognition live in the backend modules; this module owns what
+//! must behave the same whichever engine is selected: one session at a time,
+//! generation guarding so a winding-down engine cannot talk over its
+//! replacement, and the event names the frontend subscribes to.
 //!
 //! Events emitted:
-//!   `vosk-speech-partial` (String)  — in-progress text, replaces previous
-//!   `vosk-speech-result`  (String)  — finalized utterance
-//!   `vosk-error`          (String)  — capture/recognizer failure
-//!   `theta-level`         (i32)     — 0..1000 mic level, for the waveform
-//!   `theta-debug`         (String)  — timestamped log line
-//!   `theta-listening`     (bool)    — authoritative listening state
+//!   `theta-speech-partial` (String)  — in-progress text, replaces previous
+//!   `theta-speech-result`  (String)  — finalized utterance
+//!   `theta-speech-error`   (String)  — capture/recognizer failure
+//!   `theta-level`          (i32)     — 0..1000 mic level, for the waveform
+//!   `theta-debug`          (String)  — timestamped log line
+//!   `theta-listening`      (bool)    — authoritative listening state
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+pub mod vosk;
+
+#[cfg(target_os = "windows")]
+pub mod windows;
+
+use crate::settings::{SettingsState, SpeechProvider};
+use serde::Serialize;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
-use tauri::{AppHandle, Emitter, State};
-use vosk::{CompleteResult, DecodingState, Model, Recognizer};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+pub const PARTIAL_EVENT: &str = "theta-speech-partial";
+pub const RESULT_EVENT: &str = "theta-speech-result";
+pub const ERROR_EVENT: &str = "theta-speech-error";
+pub const LEVEL_EVENT: &str = "theta-level";
+pub const DEBUG_EVENT: &str = "theta-debug";
+pub const LISTENING_EVENT: &str = "theta-listening";
+
+const DEBUG_LOG_LIMIT: usize = 500;
 
 /// `HH:MM:SS.mmm` for debug lines — relative ordering is all we need.
 pub fn now_stamp() -> String {
@@ -32,58 +47,170 @@ pub fn now_stamp() -> String {
     format!("{h:02}:{m:02}:{s:02}.{millis:03}")
 }
 
-/// Vosk fixes the recognizer sample rate; everything is resampled to this.
-const VOSK_RATE: f32 = 16000.0;
+fn guard<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
-/// RMS (in normalized 0..1 units) below which a frame counts as silence.
-const SILENCE_RMS: f32 = 0.012;
+#[derive(Serialize, Clone, Copy, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCapability {
+    pub id: SpeechProvider,
+    pub label: &'static str,
+    pub supported: bool,
+}
 
-/// How long the input has to stay quiet before we force-finalize whatever
-/// partial text we have. Vosk's own endpointing is conservative, so without
-/// this the assistant feels laggy after the user stops talking.
-const ENDPOINT_SILENCE_MS: u64 = 900;
+struct Session {
+    active: bool,
+    cancel: Option<Arc<AtomicBool>>,
+}
 
 pub struct SttState {
-    pub is_listening: Arc<AtomicBool>,
-    model: Arc<Model>,
+    session: Mutex<Session>,
+    generation: Arc<AtomicU64>,
     last_partial: Arc<Mutex<String>>,
     debug_log: Arc<Mutex<Vec<String>>>,
+    capture: Arc<Mutex<()>>,
+    models: Arc<vosk::ModelCache>,
 }
 
 impl SttState {
-    pub fn new(model_path: &str) -> Self {
-        eprintln!("[theta] Loading Vosk model from {model_path}");
-        let model = Model::new(model_path).unwrap_or_else(|| {
-            panic!(
-                "[theta] Failed to load Vosk model from '{model_path}'. \
-                 Ensure the directory exists and is a valid Vosk model."
-            )
-        });
-        eprintln!("[theta] Vosk model loaded");
+    pub fn new() -> Self {
         Self {
-            is_listening: Arc::new(AtomicBool::new(false)),
-            model: Arc::new(model),
+            session: Mutex::new(Session {
+                active: false,
+                cancel: None,
+            }),
+            generation: Arc::new(AtomicU64::new(0)),
             last_partial: Arc::new(Mutex::new(String::new())),
-            debug_log: Arc::new(Mutex::new(vec![format!(
-                "[{}] model loaded: {model_path}",
-                now_stamp()
-            )])),
+            debug_log: Arc::new(Mutex::new(Vec::new())),
+            capture: Arc::new(Mutex::new(())),
+            models: Arc::new(vosk::ModelCache::new()),
         }
     }
 
     /// Mirror a line to stderr, the ring buffer, and the `theta-debug` stream.
     pub fn log(&self, app: &AppHandle, msg: impl Into<String>) {
-        let entry = format!("[{}] {}", now_stamp(), msg.into());
-        eprintln!("[theta] {entry}");
-        if let Ok(mut log) = self.debug_log.lock() {
-            log.push(entry.clone());
-            if log.len() > 500 {
-                let drop = log.len() - 500;
-                log.drain(0..drop);
-            }
-        }
-        let _ = app.emit("theta-debug", entry);
+        push_log(app, &self.debug_log, msg.into());
     }
+
+    fn is_active(&self) -> bool {
+        guard(&self.session).active
+    }
+}
+
+impl Default for SttState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn trim_log(lines: &mut Vec<String>) {
+    if lines.len() > DEBUG_LOG_LIMIT {
+        let excess = lines.len() - DEBUG_LOG_LIMIT;
+        lines.drain(0..excess);
+    }
+}
+
+fn session_is_current(current: &AtomicU64, generation: u64) -> bool {
+    current.load(Ordering::SeqCst) == generation
+}
+
+fn session_is_cancelled(cancel: &AtomicBool, current: &AtomicU64, generation: u64) -> bool {
+    cancel.load(Ordering::SeqCst) || !session_is_current(current, generation)
+}
+
+fn push_log(app: &AppHandle, log: &Mutex<Vec<String>>, msg: String) {
+    let entry = format!("[{}] {}", now_stamp(), msg);
+    eprintln!("[theta] {entry}");
+    {
+        let mut lines = guard(log);
+        lines.push(entry.clone());
+        trim_log(&mut lines);
+    }
+    let _ = app.emit(DEBUG_EVENT, entry);
+}
+
+/// The handle a backend uses to report progress.
+///
+/// Every emit is gated on the session still being the current one, so a
+/// recognizer that is still shutting down cannot overwrite transcripts or the
+/// listening state belonging to its successor.
+pub struct SessionSink {
+    app: AppHandle,
+    generation: u64,
+    current: Arc<AtomicU64>,
+    cancel: Arc<AtomicBool>,
+    last_partial: Arc<Mutex<String>>,
+    debug_log: Arc<Mutex<Vec<String>>>,
+}
+
+impl SessionSink {
+    pub fn is_current(&self) -> bool {
+        session_is_current(&self.current, self.generation)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        session_is_cancelled(&self.cancel, &self.current, self.generation)
+    }
+
+    pub fn log(&self, msg: impl Into<String>) {
+        push_log(&self.app, &self.debug_log, msg.into());
+    }
+
+    pub fn partial(&self, text: &str) {
+        if !self.is_current() {
+            return;
+        }
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let _ = self.app.emit(PARTIAL_EVENT, trimmed.to_string());
+        *guard(&self.last_partial) = trimmed.to_string();
+    }
+
+    pub fn has_partial(&self) -> bool {
+        !guard(&self.last_partial).is_empty()
+    }
+
+    pub fn publish_final(&self, text: &str) {
+        if !self.is_current() {
+            return;
+        }
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let _ = self.app.emit(RESULT_EVENT, trimmed.to_string());
+        let _ = self.app.emit(PARTIAL_EVENT, "");
+        guard(&self.last_partial).clear();
+        self.log(format!("FINAL: {trimmed:?}"));
+    }
+
+    pub fn level(&self, level: i32) {
+        if !self.is_current() {
+            return;
+        }
+        let _ = self.app.emit(LEVEL_EVENT, level);
+    }
+
+    pub fn error(&self, message: &str) {
+        self.log(format!("error: {message}"));
+        if !self.is_current() {
+            return;
+        }
+        let _ = self.app.emit(ERROR_EVENT, message.to_string());
+    }
+}
+
+fn provider_for(app: &AppHandle) -> SpeechProvider {
+    app.try_state::<SettingsState>()
+        .map(|settings| settings.snapshot().speech_recognition_provider)
+        .unwrap_or_default()
+}
+
+fn unsupported(provider: SpeechProvider) -> String {
+    format!("{} isn't available on this platform.", provider.label())
 }
 
 /// Starts capture on a background thread. Idempotent: a second call while
@@ -94,57 +221,132 @@ impl SttState {
 /// shortcut can start listening without a `tauri::State` handle; the
 /// `#[tauri::command]` below is a thin wrapper over it.
 pub fn start(app_handle: &AppHandle, state: &SttState) -> Result<(), String> {
-    if state.is_listening.swap(true, Ordering::SeqCst) {
-        return Ok(());
+    let provider = provider_for(app_handle);
+    if !provider.is_supported() {
+        return Err(unsupported(provider));
     }
 
-    if let Ok(mut p) = state.last_partial.lock() {
-        p.clear();
-    }
-    state.log(app_handle, "start_listening: requested");
-    let _ = app_handle.emit("theta-listening", true);
+    let (generation, cancel) = {
+        let mut session = guard(&state.session);
+        if session.active {
+            return Ok(());
+        }
+        let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let cancel = Arc::new(AtomicBool::new(false));
+        session.active = true;
+        session.cancel = Some(Arc::clone(&cancel));
+        (generation, cancel)
+    };
 
-    let is_listening = Arc::clone(&state.is_listening);
-    let model = Arc::clone(&state.model);
-    let last_partial = Arc::clone(&state.last_partial);
+    guard(&state.last_partial).clear();
+    state.log(
+        app_handle,
+        format!("start_listening: requested via {}", provider.label()),
+    );
+    let _ = app_handle.emit(LISTENING_EVENT, true);
+
+    let sink = Arc::new(SessionSink {
+        app: app_handle.clone(),
+        generation,
+        current: Arc::clone(&state.generation),
+        cancel,
+        last_partial: Arc::clone(&state.last_partial),
+        debug_log: Arc::clone(&state.debug_log),
+    });
+    let capture = Arc::clone(&state.capture);
+    let models = Arc::clone(&state.models);
     let app_for_thread = app_handle.clone();
 
     std::thread::spawn(move || {
-        if let Err(e) = run_listening_loop(
-            app_for_thread.clone(),
-            model,
-            Arc::clone(&is_listening),
-            last_partial,
-        ) {
-            eprintln!("[theta] listening thread error: {e}");
-            let _ = app_for_thread.emit("vosk-error", e.clone());
-            let _ = app_for_thread.emit(
-                "theta-debug",
-                format!("[{}] start_listening error: {e}", now_stamp()),
-            );
+        // Sessions take turns on the microphone: a replacement engine waits
+        // for its predecessor to let go rather than fighting it for the
+        // device. By the time the lock is free the older session has already
+        // been superseded, so it exits without touching any hardware.
+        let held = guard(&capture);
+        let outcome = if sink.is_cancelled() {
+            Ok(())
+        } else {
+            run_backend(provider, &sink, &models)
+        };
+        drop(held);
+
+        if let Err(message) = outcome {
+            sink.error(&message);
         }
-        is_listening.store(false, Ordering::SeqCst);
-        let _ = app_for_thread.emit("theta-listening", false);
-        let _ = app_for_thread.emit(
-            "theta-debug",
-            format!("[{}] listening thread exited", now_stamp()),
-        );
+        sink.log("listening thread exited");
+        finish_session(&app_for_thread, generation);
     });
 
     Ok(())
 }
 
+fn run_backend(
+    provider: SpeechProvider,
+    sink: &Arc<SessionSink>,
+    models: &vosk::ModelCache,
+) -> Result<(), String> {
+    match provider {
+        SpeechProvider::Vosk => vosk::run(sink, models),
+        SpeechProvider::Windows => run_windows(sink),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows(sink: &Arc<SessionSink>) -> Result<(), String> {
+    windows::run(sink)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn run_windows(_sink: &Arc<SessionSink>) -> Result<(), String> {
+    Err(unsupported(SpeechProvider::Windows))
+}
+
 /// Signals the capture thread to wind down. Also plain-function form.
 pub fn stop(app_handle: &AppHandle, state: &SttState) {
-    state.log(app_handle, "stop_listening: requested");
-    state.is_listening.store(false, Ordering::SeqCst);
-    let _ = app_handle.emit("vosk-speech-partial", "");
-    let _ = app_handle.emit("theta-listening", false);
+    let cancel = {
+        let mut session = guard(&state.session);
+        session.active = false;
+        session.cancel.take()
+    };
+    if let Some(cancel) = cancel {
+        cancel.store(true, Ordering::SeqCst);
+        state.log(app_handle, "stop_listening: requested");
+    }
+    guard(&state.last_partial).clear();
+    let _ = app_handle.emit(PARTIAL_EVENT, "");
+    let _ = app_handle.emit(LISTENING_EVENT, false);
+}
+
+/// Ends whatever session is running, for callers that only hold an
+/// `AppHandle` — notably a settings save that switches engines.
+pub fn stop_active_session(app_handle: &AppHandle) {
+    if let Some(state) = app_handle.try_state::<SttState>() {
+        stop(app_handle, &state);
+    }
+}
+
+fn finish_session(app_handle: &AppHandle, generation: u64) {
+    let Some(state) = app_handle.try_state::<SttState>() else {
+        return;
+    };
+    if state.generation.load(Ordering::SeqCst) != generation {
+        return;
+    }
+    {
+        let mut session = guard(&state.session);
+        session.active = false;
+        session.cancel = None;
+    }
+    guard(&state.last_partial).clear();
+    let _ = app_handle.emit(PARTIAL_EVENT, "");
+    let _ = app_handle.emit(LEVEL_EVENT, 0);
+    let _ = app_handle.emit(LISTENING_EVENT, false);
 }
 
 /// Flips listening on or off. Used by the tray menu and global shortcut.
 pub fn toggle(app_handle: &AppHandle, state: &SttState) -> Result<bool, String> {
-    if state.is_listening.load(Ordering::SeqCst) {
+    let active = state.is_active();
+    if active {
         stop(app_handle, state);
         Ok(false)
     } else {
@@ -170,300 +372,115 @@ pub fn toggle_listening(app_handle: AppHandle, state: State<'_, SttState>) -> Re
 
 #[tauri::command]
 pub fn is_listening(state: State<'_, SttState>) -> bool {
-    state.is_listening.load(Ordering::SeqCst)
+    state.is_active()
 }
 
 #[tauri::command]
 pub fn get_debug_log(state: State<'_, SttState>) -> Vec<String> {
-    state
-        .debug_log
-        .lock()
-        .map(|log| log.clone())
-        .unwrap_or_default()
+    guard(&state.debug_log).clone()
 }
 
 /// Names of available input devices, for the settings panel.
 #[tauri::command]
 pub fn list_input_devices() -> Result<Vec<String>, String> {
-    let host = cpal::default_host();
-    let devices = host
-        .input_devices()
-        .map_err(|e| format!("Failed to enumerate input devices: {e}"))?;
-    Ok(devices.map(|d| d.to_string()).collect())
+    vosk::list_input_devices()
 }
 
-/// Everything the audio callback touches, in one place.
-///
-/// The original code duplicated this body once per `cpal::SampleFormat`.
-/// Each format branch now only converts its native sample type to
-/// interleaved `f32` and calls [`Pipeline::feed`].
-struct Pipeline {
-    app: AppHandle,
-    recognizer: Arc<Mutex<Recognizer>>,
-    last_partial: Arc<Mutex<String>>,
-    channels: usize,
-    src_rate: u32,
-    /// Carries the fractional resample offset across callbacks so chunk
-    /// boundaries don't click.
-    resample_acc: Mutex<f64>,
-    level_tick: AtomicU32,
-    /// Millis-since-epoch of the last frame loud enough to count as speech.
-    last_voice_ms: AtomicU64,
+/// Which engines this build can actually run, so the UI can disable the rest.
+#[tauri::command]
+pub fn speech_providers() -> Vec<ProviderCapability> {
+    [SpeechProvider::Vosk, SpeechProvider::Windows]
+        .into_iter()
+        .map(|id| ProviderCapability {
+            id,
+            label: id.label(),
+            supported: id.is_supported(),
+        })
+        .collect()
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl Pipeline {
-    fn feed(&self, interleaved: &[f32]) {
-        let mono: Vec<f32> = if self.channels <= 1 {
-            interleaved.to_vec()
-        } else {
-            interleaved
-                .chunks(self.channels)
-                .map(|frame| frame.iter().sum::<f32>() / self.channels as f32)
-                .collect()
-        };
-        if mono.is_empty() {
-            return;
-        }
-
-        // RMS on the normalized mono signal, before the i16 conversion, so
-        // the silence threshold is a plain 0..1 amplitude.
-        let rms = (mono.iter().map(|s| s * s).sum::<f32>() / mono.len() as f32).sqrt();
-        if rms > SILENCE_RMS {
-            self.last_voice_ms.store(now_ms(), Ordering::Relaxed);
-        }
-
-        // Emit a level roughly 1 in every 3 callbacks — enough for a smooth
-        // waveform without flooding the event bridge.
-        if self.level_tick.fetch_add(1, Ordering::Relaxed) % 3 == 0 {
-            let level = (rms * 4000.0).min(1000.0).round() as i32;
-            let _ = self.app.emit("theta-level", level);
-        }
-
-        let samples = resample_to_i16(&mono, self.src_rate, VOSK_RATE as u32, &self.resample_acc);
-        if samples.is_empty() {
-            return;
-        }
-
-        let Ok(mut rec) = self.recognizer.lock() else {
-            return;
-        };
-
-        match rec.accept_waveform(&samples) {
-            Ok(DecodingState::Finalized) => {
-                if let CompleteResult::Single(result) = rec.result() {
-                    self.publish_final(result.text.trim());
-                }
-            }
-            Ok(_) => {
-                let ptext = rec.partial_result().partial.trim().to_string();
-                if !ptext.is_empty() {
-                    let _ = self.app.emit("vosk-speech-partial", ptext.clone());
-                    if let Ok(mut p) = self.last_partial.lock() {
-                        *p = ptext;
-                    }
-                }
-                // Vosk endpoints conservatively. If we're sitting on text and
-                // the room has gone quiet, cut the utterance ourselves.
-                let quiet_for = now_ms().saturating_sub(self.last_voice_ms.load(Ordering::Relaxed));
-                let have_text = self
-                    .last_partial
-                    .lock()
-                    .map(|p| !p.is_empty())
-                    .unwrap_or(false);
-                if have_text && quiet_for > ENDPOINT_SILENCE_MS {
-                    if let CompleteResult::Single(result) = rec.final_result() {
-                        let text = result.text.trim().to_string();
-                        self.publish_final(&text);
-                    }
-                    rec.reset();
-                }
-            }
-            Err(e) => {
-                eprintln!("[theta] accept_waveform error: {e}");
-                let _ = self.app.emit(
-                    "theta-debug",
-                    format!("[{}] accept_waveform error: {e}", now_stamp()),
-                );
-            }
-        }
+    #[test]
+    fn trim_log_keeps_the_most_recent_lines() {
+        let mut lines: Vec<String> = (0..(DEBUG_LOG_LIMIT + 25))
+            .map(|index| format!("line {index}"))
+            .collect();
+        trim_log(&mut lines);
+        assert_eq!(lines.len(), DEBUG_LOG_LIMIT);
+        assert_eq!(lines[0], "line 25");
+        assert_eq!(lines[DEBUG_LOG_LIMIT - 1], format!("line {}", DEBUG_LOG_LIMIT + 24));
     }
 
-    fn publish_final(&self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        let _ = self.app.emit("vosk-speech-result", text.to_string());
-        let _ = self.app.emit("vosk-speech-partial", "");
-        let _ = self
-            .app
-            .emit("theta-debug", format!("[{}] FINAL: {text:?}", now_stamp()));
-        if let Ok(mut p) = self.last_partial.lock() {
-            p.clear();
-        }
-    }
-}
-
-fn run_listening_loop(
-    app_handle: AppHandle,
-    model: Arc<Model>,
-    is_listening: Arc<AtomicBool>,
-    last_partial: Arc<Mutex<String>>,
-) -> Result<(), String> {
-    let host = cpal::default_host();
-    let device = host.default_input_device().ok_or(
-        "No microphone found. Plug one in or pick an input device in Windows sound settings.",
-    )?;
-    let supported = device
-        .default_input_config()
-        .map_err(|e| format!("Failed to get input config: {e}"))?;
-
-    let src_rate: u32 = supported.sample_rate();
-    let channels = supported.channels() as usize;
-    let sample_format = supported.sample_format();
-    let device_name = device.to_string();
-
-    let _ = app_handle.emit(
-        "theta-debug",
-        format!(
-            "[{}] device: {device_name} | ch={channels} rate={src_rate} fmt={sample_format:?}",
-            now_stamp()
-        ),
-    );
-
-    let mut recognizer =
-        Recognizer::new(&model, VOSK_RATE).ok_or("Failed to create Vosk recognizer")?;
-    recognizer.set_words(true);
-    let recognizer = Arc::new(Mutex::new(recognizer));
-
-    let pipeline = Arc::new(Pipeline {
-        app: app_handle.clone(),
-        recognizer: Arc::clone(&recognizer),
-        last_partial: Arc::clone(&last_partial),
-        channels,
-        src_rate,
-        resample_acc: Mutex::new(0.0),
-        level_tick: AtomicU32::new(0),
-        last_voice_ms: AtomicU64::new(now_ms()),
-    });
-
-    let config: cpal::StreamConfig = supported.into();
-    let on_err = |err| eprintln!("[theta] audio stream error: {err}");
-
-    // One arm per native sample format; each converts to f32 and delegates.
-    let stream = match sample_format {
-        cpal::SampleFormat::F32 => {
-            let p = Arc::clone(&pipeline);
-            device.build_input_stream(
-                config,
-                move |data: &[f32], _: &_| p.feed(data),
-                on_err,
-                None,
-            )
-        }
-        cpal::SampleFormat::I16 => {
-            let p = Arc::clone(&pipeline);
-            device.build_input_stream(
-                config,
-                move |data: &[i16], _: &_| {
-                    let f: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-                    p.feed(&f);
-                },
-                on_err,
-                None,
-            )
-        }
-        cpal::SampleFormat::U16 => {
-            let p = Arc::clone(&pipeline);
-            device.build_input_stream(
-                config,
-                move |data: &[u16], _: &_| {
-                    let f: Vec<f32> = data
-                        .iter()
-                        .map(|&s| (s as f32 - 32768.0) / 32768.0)
-                        .collect();
-                    p.feed(&f);
-                },
-                on_err,
-                None,
-            )
-        }
-        fmt => return Err(format!("Unsupported sample format: {fmt:?}")),
-    }
-    .map_err(|e| format!("Failed to build input stream: {e}"))?;
-
-    stream
-        .play()
-        .map_err(|e| format!("Failed to start audio stream: {e}"))?;
-    let _ = app_handle.emit(
-        "theta-debug",
-        format!("[{}] stream.play() OK — listening", now_stamp()),
-    );
-
-    while is_listening.load(Ordering::SeqCst) {
-        std::thread::sleep(std::time::Duration::from_millis(80));
+    #[test]
+    fn trim_log_leaves_short_logs_alone() {
+        let mut lines = vec!["only".to_string()];
+        trim_log(&mut lines);
+        assert_eq!(lines, vec!["only".to_string()]);
     }
 
-    let _ = app_handle.emit(
-        "theta-debug",
-        format!("[{}] is_listening=false — stopping stream", now_stamp()),
-    );
-    drop(stream);
-    let _ = app_handle.emit("theta-level", 0);
-
-    // A manual stop can leave audio sitting in Vosk's buffer waiting for
-    // trailing silence that will never come. Flush it.
-    if let Ok(mut rec) = recognizer.lock() {
-        if let CompleteResult::Single(result) = rec.final_result() {
-            let text = result.text.trim().to_string();
-            if !text.is_empty() {
-                let _ = app_handle.emit("vosk-speech-result", text.clone());
-                let _ = app_handle.emit(
-                    "theta-debug",
-                    format!("[{}] FINAL (flushed on stop): {text:?}", now_stamp()),
-                );
-                if let Ok(mut p) = last_partial.lock() {
-                    p.clear();
-                }
-            }
-        }
+    #[test]
+    fn a_superseded_session_is_never_current() {
+        let current = AtomicU64::new(4);
+        assert!(session_is_current(&current, 4));
+        current.store(5, Ordering::SeqCst);
+        assert!(!session_is_current(&current, 4));
     }
 
-    Ok(())
-}
+    #[test]
+    fn a_superseded_session_reads_as_cancelled() {
+        let current = AtomicU64::new(7);
+        let cancel = AtomicBool::new(false);
+        assert!(!session_is_cancelled(&cancel, &current, 7));
 
-/// Linear resampler, mono f32 in → mono i16 at `dst_rate`.
-///
-/// `acc` holds the leftover fractional read position between calls, which is
-/// what keeps consecutive callbacks from producing a seam.
-fn resample_to_i16(input: &[f32], src_rate: u32, dst_rate: u32, acc: &Mutex<f64>) -> Vec<i16> {
-    let to_i16 = |s: f32| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-
-    if src_rate == dst_rate {
-        return input.iter().copied().map(to_i16).collect();
+        current.store(8, Ordering::SeqCst);
+        assert!(
+            session_is_cancelled(&cancel, &current, 7),
+            "a replaced session must stop even though nobody set its cancel flag"
+        );
     }
 
-    let ratio = src_rate as f64 / dst_rate as f64;
-    let mut guard = match acc.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let mut pos = *guard;
-    let mut out = Vec::with_capacity((input.len() as f64 / ratio).ceil() as usize + 1);
-    while pos < input.len() as f64 {
-        let idx = pos as usize;
-        let frac = (pos - idx as f64) as f32;
-        let s0 = input.get(idx).copied().unwrap_or(0.0);
-        let s1 = input.get(idx + 1).copied().unwrap_or(s0);
-        out.push(to_i16(s0 + (s1 - s0) * frac));
-        pos += ratio;
+    #[test]
+    fn an_explicit_stop_cancels_the_current_session() {
+        let current = AtomicU64::new(2);
+        let cancel = AtomicBool::new(false);
+        cancel.store(true, Ordering::SeqCst);
+        assert!(session_is_cancelled(&cancel, &current, 2));
+        assert!(
+            session_is_current(&current, 2),
+            "a stopped session is still the current one, so its final flush publishes"
+        );
     }
-    *guard = (pos - input.len() as f64).max(0.0);
-    out
+
+    #[test]
+    fn providers_report_platform_support() {
+        let providers = speech_providers();
+        assert_eq!(providers.len(), 2);
+
+        let vosk = providers
+            .iter()
+            .find(|provider| matches!(provider.id, SpeechProvider::Vosk))
+            .expect("vosk should be listed");
+        assert!(vosk.supported);
+
+        let windows = providers
+            .iter()
+            .find(|provider| matches!(provider.id, SpeechProvider::Windows))
+            .expect("windows should be listed");
+        assert_eq!(windows.supported, cfg!(target_os = "windows"));
+    }
+
+    #[test]
+    fn a_new_state_is_idle() {
+        let state = SttState::new();
+        assert!(!state.is_active());
+        assert_eq!(state.generation.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn unsupported_message_names_the_provider() {
+        assert!(unsupported(SpeechProvider::Windows).contains("Windows Speech Recognition"));
+    }
 }

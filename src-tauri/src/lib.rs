@@ -5,7 +5,7 @@
 //!
 //! | module      | what it does                                              |
 //! |-------------|-----------------------------------------------------------|
-//! | [`stt`]     | Vosk speech-to-text over a cpal capture stream            |
+//! | [`stt`]     | speech-to-text via Vosk or Windows Speech Recognition     |
 //! | [`rag`]     | local hybrid retrieval (BM25 + character trigrams)        |
 //! | [`procs`]   | process / system / port inspection, shell commands        |
 //! | [`calendar`]| Google Calendar OAuth + v3 CRUD                           |
@@ -91,6 +91,7 @@ fn hide_to_tray(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn quit_app(app: AppHandle) {
+    stt::stop_active_session(&app);
     app.exit(0);
 }
 
@@ -131,24 +132,18 @@ fn on_hotkey(app: &AppHandle) {
 
     // Revealing a hidden window shouldn't also stop an in-flight recording,
     // so only toggle when the window was already on screen.
-    let start_only = !was_visible;
-    let result = if start_only {
+    let result = if !was_visible {
         if auto_listen {
-            stt::start(app, &stt).map(|_| true)
+            stt::start(app, &stt)
         } else {
-            Ok(false)
+            Ok(())
         }
     } else {
-        stt::toggle(app, &stt)
+        stt::toggle(app, &stt).map(|_| ())
     };
 
-    match result {
-        Ok(listening) => {
-            let _ = app.emit("theta-hotkey", listening);
-        }
-        Err(e) => {
-            let _ = app.emit("vosk-error", e);
-        }
+    if let Err(e) = result {
+        let _ = app.emit(stt::ERROR_EVENT, e);
     }
 }
 
@@ -191,17 +186,15 @@ fn on_tray_menu_event(app: &AppHandle, event: MenuEvent) {
         "listen" => {
             reveal(app);
             if let Some(stt) = app.try_state::<stt::SttState>() {
-                match stt::toggle(app, &stt) {
-                    Ok(listening) => {
-                        let _ = app.emit("theta-hotkey", listening);
-                    }
-                    Err(e) => {
-                        let _ = app.emit("vosk-error", e);
-                    }
+                if let Err(e) = stt::toggle(app, &stt) {
+                    let _ = app.emit(stt::ERROR_EVENT, e);
                 }
             }
         }
-        "quit" => app.exit(0),
+        "quit" => {
+            stt::stop_active_session(app);
+            app.exit(0);
+        }
         _ => {}
     }
 }
@@ -244,60 +237,8 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
 // App entry point
 // ---------------------------------------------------------------------------
 
-/// Resolves the Vosk model directory.
-///
-/// Looks for `vosk-models/vosk-model-small-en-us-0.15` relative to the running
-/// executable (works for `cargo run`/`tauri dev`, where the exe lives in
-/// `target/<profile>/`, by walking up to find `src-tauri`), and also relative
-/// to the crate manifest dir. Panics with a clear message if not found.
-fn resolve_vosk_model_path() -> String {
-    const MODEL_DIR_NAME: &str = "vosk-model-small-en-us-0.15";
-    const RELATIVE_PATHS: &[&str] = &[
-        "src-tauri/vosk-models",
-        "vosk-models",
-        "../src-tauri/vosk-models",
-    ];
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            for up in 0..=3 {
-                let mut base = exe_dir.to_path_buf();
-                for _ in 0..up {
-                    if !base.pop() {
-                        break;
-                    }
-                }
-                for rel in RELATIVE_PATHS {
-                    let candidate = base.join(rel).join(MODEL_DIR_NAME);
-                    if candidate.is_dir() {
-                        return candidate.to_string_lossy().into_owned();
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(manifest) = std::option_env!("CARGO_MANIFEST_DIR") {
-        let candidate = std::path::Path::new(manifest)
-            .join("vosk-models")
-            .join(MODEL_DIR_NAME);
-        if candidate.is_dir() {
-            return candidate.to_string_lossy().into_owned();
-        }
-    }
-
-    panic!(
-        "Vosk model '{MODEL_DIR_NAME}' not found. Expected it under \
-         `src-tauri/vosk-models/{MODEL_DIR_NAME}` (containing am/, conf/, \
-         graph/, ivector/). Download it from \
-         https://alphacephei.com/vosk/models and extract it there."
-    )
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let model_path = resolve_vosk_model_path();
-
     tauri::Builder::default()
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
@@ -307,7 +248,7 @@ pub fn run() {
             // the user's face; the frontend reads this argv flag.
             Some(vec!["--hidden"]),
         ))
-        .manage(stt::SttState::new(&model_path))
+        .manage(stt::SttState::new())
         .manage(procs::ProcState::new())
         .setup(|app| {
             // RAG and OAuth tokens are per-user state, so they live in the
@@ -381,6 +322,7 @@ pub fn run() {
             stt::is_listening,
             stt::get_debug_log,
             stt::list_input_devices,
+            stt::speech_providers,
             // processes / terminal
             procs::list_processes,
             procs::system_stats,

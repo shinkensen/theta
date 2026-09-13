@@ -21,6 +21,9 @@ const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 const API_BASE: &str = "https://www.googleapis.com/calendar/v3";
 const SCOPE: &str = "https://www.googleapis.com/auth/calendar";
 
+const DEFAULT_CLIENT_ID: &str = "194132598772-klc5e34n4qqksjf5j1o2a85rt3qj9jk6.apps.googleusercontent.com";
+const DEFAULT_CLIENT_SECRET: &str = "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";
+
 /// Refresh this many seconds before actual expiry.
 const REFRESH_SKEW_SECS: i64 = 120;
 
@@ -189,7 +192,17 @@ pub struct AuthStatus {
 
 #[tauri::command]
 pub fn google_auth_status(state: tauri::State<'_, CalendarState>) -> Result<AuthStatus, String> {
-    let auth = state.snapshot()?;
+    let mut auth = state.snapshot()?;
+    
+    // Auto-configure with default credentials if not set
+    if auth.client_id.is_none() {
+        state.update(|a| {
+            a.client_id = Some(DEFAULT_CLIENT_ID.to_string());
+            a.client_secret = Some(DEFAULT_CLIENT_SECRET.to_string());
+        })?;
+        auth = state.snapshot()?;
+    }
+    
     Ok(AuthStatus {
         connected: auth.refresh_token.is_some(),
         has_credentials: auth.client_id.is_some(),

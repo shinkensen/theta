@@ -3,14 +3,21 @@
 Theta is an agentic voice assistant built with React, TypeScript, Rust, and Tauri. It implements a modular integrations architecture coupled with local speech to text, some rag based memory, an OpenRouter-powered (customizable though) agent, optional web search, and natural text-to-speech as well as a variety of integrations like one for Canvas, Spotify, Google Calendar, Notion, MineStrator, and Gmail.
 ## Architecture
 
-Microphone -> cpal -> Vosk Lightweight Voice Recognition -> OpenRouter agent -> Tool Calls -> Edge Neural Text to Speech
+Microphone -> Vosk or Windows Speech Recognition -> OpenRouter agent -> Tool Calls -> Edge Neural Text to Speech
+
+## Speech recognition
+
+Theta has 2 systems in place for speech recognition:
+
+    1- VOSK (small model, its not super good but its more accessible)
+    2- Windows Default (IMPORTANT NOTE: You must go into settings -> Privcy & Security -> Speech and then turn on online speech recognition)
 
 ## Prerequisites
 - node.js and npm.
 - rust and cargo
 - Tauri, Webview2 and C++ Build Tools
 - An OpenRouter API key
-- Vosk Windows SDK and model.
+- Vosk Windows SDK and model (only for the Vosk engine).
 
 ## Installation
 
@@ -69,7 +76,9 @@ Theta has two distinct local memory systems:
 │   │   ├── profile.rs         # Structured About Me persistence
 │   │   ├── rag.rs             # Local retrieval and storage
 │   │   ├── settings.rs        # Persisted preferences
-│   │   ├── stt.rs             # cpal/Vosk recognition
+│   │   ├── stt.rs             # Speech-to-text lifecycle and backend selection
+│   │   ├── stt/vosk.rs        # Offline cpal/Vosk recognition
+│   │   ├── stt/windows.rs     # Windows Speech Recognition dictation
 │   │   └── lib.rs             # Tauri setup, tray, hotkey, commands
 │   ├── vosk/                  # Windows native SDK (local setup)
 │   ├── vosk-models/           # Recognition model (local setup)

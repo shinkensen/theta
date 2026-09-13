@@ -11,11 +11,15 @@ import type { GithubToolName } from "./integrations/githubTools";
 import type { HackatimeToolName } from "./integrations/hackatimeTools";
 import type { SpotifyToolName } from "./integrations/spotifyTools";
 
+export type SpeechProvider = "vosk" | "windows";
+export interface SpeechProviderCapability { id: SpeechProvider; label: string; supported: boolean }
+
 export interface Settings {
   hotkey: string;
   closeToTray: boolean;
   launchAtLogin: boolean;
   autoListenOnShow: boolean;
+  speechRecognitionProvider: SpeechProvider;
   speakReplies: boolean;
   voice: string;
   model: string;

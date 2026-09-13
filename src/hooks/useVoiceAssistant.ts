@@ -10,7 +10,7 @@ export type AssistantStatus = "standby" | "listening" | "thinking" | "speaking" 
 export interface TranscriptEntry { id: string; role: "user" | "assistant"; text: string; timestamp: number }
 export interface Toast { id: string; text: string; tone: "info" | "error" | "success" }
 type PendingConfirmation = ConfirmationRequest & { resolve: (approved: boolean) => void };
-const DEFAULT_SETTINGS: Settings = { hotkey: "CommandOrControl+Shift+Space", closeToTray: true, launchAtLogin: false, autoListenOnShow: true, speakReplies: true, voice: "en-GB-SoniaNeural", model: "openrouter/free", useRag: true, allowWeb: true, autoApprove: false, calendarId: "primary" };
+const DEFAULT_SETTINGS: Settings = { hotkey: "CommandOrControl+Shift+Space", closeToTray: true, launchAtLogin: false, autoListenOnShow: true, speechRecognitionProvider: "vosk", speakReplies: true, voice: "en-GB-SoniaNeural", model: "openrouter/free", useRag: true, allowWeb: true, autoApprove: false, calendarId: "primary" };
 function guid(): string { return crypto.randomUUID().replace(/-/g, ""); }
 function errorDetail(error: unknown): string {
   if (error instanceof Error) return error.stack || `${error.name}: ${error.message}`;
@@ -96,12 +96,11 @@ export function useVoiceAssistant() {
   useEffect(() => {
     const unsubs: UnlistenFn[] = []; let disposed = false;
     const bind = async <T,>(name: string, handler: (payload: T) => void) => { const off = await listen<T>(name, (event) => handler(event.payload)); if (disposed) off(); else unsubs.push(off); };
-    void bind<string>("vosk-speech-partial", setPartial);
-    void bind<string>("vosk-speech-result", (text) => { setPartial(""); void submitText(text); });
-    void bind<string>("vosk-error", (message) => { setErrorMessage(String(message)); toast(String(message), "error"); });
+    void bind<string>("theta-speech-partial", setPartial);
+    void bind<string>("theta-speech-result", (text) => { setPartial(""); void submitText(text); });
+    void bind<string>("theta-speech-error", (message) => { setErrorMessage(String(message)); toast(String(message), "error"); });
     void bind<boolean>("theta-listening", setIsListening);
     void bind<number>("theta-level", (value) => setLevel(Math.max(0, Math.min(1, Number(value) / 1000))));
-    void bind<boolean>("theta-hotkey", setIsListening);
     void bind<string>("theta-debug", (line) => setDebugLogs((v) => [...v.slice(-49), line]));
     void invoke<boolean>("is_listening").then(setIsListening).catch(() => undefined);
     return () => { disposed = true; unsubs.forEach((off) => off()); abortRef.current?.abort(); confirmationRef.current?.resolve(false); };
