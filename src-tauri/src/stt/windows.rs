@@ -6,6 +6,12 @@
 //! running while the window is hidden, so the tray and global hotkey behave
 //! the same as they do under Vosk.
 //!
+//! WinRT raises its recognition events on the thread that created the
+//! recognizer, and only if that thread is apartment-threaded and keeps
+//! pumping window messages — so a session here runs on its own STA message
+//! loop. A plain worker thread that sleeps between polls never sees a single
+//! event, no matter how healthy the microphone is.
+//!
 //! The trade-off is that the OS gives us no access to the raw waveform, so
 //! this backend reports a flat level and the UI animates from listening state
 //! alone.
@@ -24,17 +30,27 @@ use ::windows::Media::SpeechRecognition::{
     SpeechRecognitionResultStatus, SpeechRecognitionScenario, SpeechRecognitionTopicConstraint,
     SpeechRecognizer,
 };
-use ::windows::Win32::System::WinRT::{RoInitialize, RoUninitialize, RO_INIT_MULTITHREADED};
+use ::windows::Win32::System::WinRT::{
+    RoInitialize, RoUninitialize, RO_INIT_SINGLETHREADED,
+};
+use ::windows::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+};
 
 const POLL: Duration = Duration::from_millis(50);
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(1500);
+
+/// How often the run loop may restart a session the OS ended for silence
+/// before it gives up. Speech activity resets the count, so this only trips
+/// when recognition keeps timing out without ever hearing anything.
+const MAX_RESTARTS: u32 = 100;
 
 const ACCESS_DENIED: i32 = -2147024891;
 const CLASS_NOT_REGISTERED: i32 = -2147221164;
 const SPERR_NOT_FOUND: i32 = -2147201015; // 0x8004503a - Speech privacy policy not accepted
 
 pub fn run(sink: &Arc<SessionSink>) -> Result<(), String> {
-    let initialized = unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.is_ok();
+    let initialized = unsafe { RoInitialize(RO_INIT_SINGLETHREADED) }.is_ok();
     let outcome = recognize(sink);
     if initialized {
         unsafe { RoUninitialize() };
@@ -180,20 +196,47 @@ fn dictate(sink: &Arc<SessionSink>, recognizer: &SpeechRecognizer) -> Result<(),
     if started.is_ok() {
         sink.log("Windows Speech Recognition started");
         sink.log("Listening for audio input... Speak now to test microphone.");
-        
+
         let mut no_audio_warned = false;
+        let mut restarts: u32 = 0;
         let start_time = Instant::now();
-        
+
         while !sink.is_cancelled() && !finished.load(Ordering::SeqCst) {
+            // Events arrive as window messages on this thread; without the
+            // pump below, not one hypothesis or result is ever delivered.
+            pump_messages();
             std::thread::sleep(POLL);
-            
-            // Warn if no audio after 5 seconds
-            if !no_audio_warned && start_time.elapsed() > Duration::from_secs(5) {
-                sink.log("No audio detected yet. Check that:");
-                sink.log("1. Your microphone is the Windows default recording device");
-                sink.log("2. The microphone is not muted");
-                sink.log("3. Microphone permissions are enabled in Windows Settings > Privacy & security > Microphone");
-                no_audio_warned = true;
+
+            // The OS ends the session itself on silence/pause timeouts.
+            // That's normal for continuous dictation — start it again so one
+            // long pause doesn't silently kill listening until the next toggle.
+            if finished.load(Ordering::SeqCst) {
+                let status = SpeechRecognitionResultStatus(final_status.load(Ordering::SeqCst));
+                if !restartable(status) || restarts >= MAX_RESTARTS {
+                    break;
+                }
+                restarts += 1;
+                finished.store(false, Ordering::SeqCst);
+                sink.log(format!(
+                    "session ended on its own (status {}); restarting ({restarts}/{MAX_RESTARTS})",
+                    status.0
+                ));
+                // A completed session refuses StartAsync until it has been
+                // stopped, so transition it back first.
+                let _ = session.StopAsync().and_then(|operation| operation.get());
+                if let Err(e) = session.StartAsync().and_then(|operation| operation.get()) {
+                    sink.log(format!("couldn't restart dictation: {}", e.message()));
+                    break;
+                }
+
+                // Warn if nothing was heard after the first few rounds
+                if !no_audio_warned && start_time.elapsed() > Duration::from_secs(5) {
+                    sink.log("No audio detected yet. Check that:");
+                    sink.log("1. Your microphone is the Windows default recording device");
+                    sink.log("2. The microphone is not muted");
+                    sink.log("3. Microphone permissions are enabled in Windows Settings > Privacy & security > Microphone");
+                    no_audio_warned = true;
+                }
             }
         }
 
@@ -206,7 +249,13 @@ fn dictate(sink: &Arc<SessionSink>, recognizer: &SpeechRecognizer) -> Result<(),
             } else {
                 session.CancelAsync().and_then(|operation| operation.get())
             };
-            await_completion(&finished);
+            // Keep pumping while the stop settles, or its completion event
+            // can never be delivered back to this thread.
+            let deadline = Instant::now() + SHUTDOWN_GRACE;
+            while !finished.load(Ordering::SeqCst) && Instant::now() < deadline {
+                pump_messages();
+                std::thread::sleep(POLL);
+            }
         }
     }
 
@@ -225,11 +274,25 @@ fn dictate(sink: &Arc<SessionSink>, recognizer: &SpeechRecognizer) -> Result<(),
     }
 }
 
-fn await_completion(finished: &AtomicBool) {
-    let deadline = Instant::now() + SHUTDOWN_GRACE;
-    while !finished.load(Ordering::SeqCst) && Instant::now() < deadline {
-        std::thread::sleep(POLL);
+/// Drains pending window messages so WinRT can deliver event callbacks on
+/// this thread. Recognizer events arrive through this queue, not through
+/// the poll loop.
+fn pump_messages() {
+    let mut msg = MSG::default();
+    unsafe {
+        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
     }
+}
+
+/// Session endings worth retrying: the OS gave up on silence or a pause
+/// limit, but nothing is wrong with the microphone or the language pack.
+fn restartable(status: SpeechRecognitionResultStatus) -> bool {
+    status == SpeechRecognitionResultStatus::TimeoutExceeded
+        || status == SpeechRecognitionResultStatus::PauseLimitExceeded
+        || status == SpeechRecognitionResultStatus::UserCanceled
 }
 
 fn ended_normally(status: SpeechRecognitionResultStatus) -> bool {
@@ -287,6 +350,22 @@ fn failure(action: &str, error: &WinError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silence_timeouts_are_worth_restarting() {
+        assert!(restartable(SpeechRecognitionResultStatus::TimeoutExceeded));
+        assert!(restartable(SpeechRecognitionResultStatus::PauseLimitExceeded));
+        assert!(restartable(SpeechRecognitionResultStatus::UserCanceled));
+    }
+
+    #[test]
+    fn real_failures_are_not_restarted() {
+        assert!(!restartable(SpeechRecognitionResultStatus::MicrophoneUnavailable));
+        assert!(!restartable(SpeechRecognitionResultStatus::NetworkFailure));
+        assert!(!restartable(
+            SpeechRecognitionResultStatus::TopicLanguageNotSupported
+        ));
+    }
 
     #[test]
     fn normal_endings_are_not_reported_as_errors() {

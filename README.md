@@ -17,12 +17,11 @@ Theta has 2 systems in place for speech recognition:
 - rust and cargo
 - Tauri, Webview2 and C++ Build Tools
 - An OpenRouter API key
-- Vosk Windows SDK and model (only for the Vosk engine).
 
 ## Installation
 
 ```powershell
-git clone <repository-url>
+git clone https://github.com/shinkensen/theta.git
 cd theta
 npm install
 ```
@@ -57,34 +56,3 @@ Theta has two distinct local memory systems:
 
 - **RAG memory** stores any documents that the user gives for future use.
 - **About Me profile** automatically infers any hobbies, interests, or ideas that the user has and stores them here.
-
-## Repository structure
-
-```text
-.
-├── src/
-│   ├── agent/                 # OpenRouter loop, tools, profile extraction
-│   ├── hooks/                 # Voice-assistant orchestration
-│   ├── voice/                 # Edge TTS and system fallback
-│   ├── App.tsx                # Application shell and views
-│   └── App.css                # Calm-premium visual system
-├── src-tauri/
-│   ├── src/
-│   │   ├── calendar.rs        # Google OAuth and Calendar API
-│   │   ├── canvas.rs          # Canvas authentication and read-only API
-│   │   ├── procs.rs           # Process/system/port tools
-│   │   ├── profile.rs         # Structured About Me persistence
-│   │   ├── rag.rs             # Local retrieval and storage
-│   │   ├── settings.rs        # Persisted preferences
-│   │   ├── stt.rs             # Speech-to-text lifecycle and backend selection
-│   │   ├── stt/vosk.rs        # Offline cpal/Vosk recognition
-│   │   ├── stt/windows.rs     # Windows Speech Recognition dictation
-│   │   └── lib.rs             # Tauri setup, tray, hotkey, commands
-│   ├── vosk/                  # Windows native SDK (local setup)
-│   ├── vosk-models/           # Recognition model (local setup)
-│   ├── build.rs               # Vosk linker and DLL-copy setup
-│   └── tauri.conf.json        # Window, bundle, and build configuration
-├── package.json
-└── README.md
-```
-
