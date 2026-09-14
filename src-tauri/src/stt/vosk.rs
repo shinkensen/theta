@@ -1,12 +1,4 @@
-//! Offline speech-to-text on top of Vosk + cpal.
-//!
-//! Captures from the default input device in whatever native format it
-//! offers, down-mixes to mono, linearly resamples to the 16 kHz Vosk wants,
-//! and streams partial/final transcripts through the shared session sink.
-//!
-//! The model is several hundred megabytes on disk, so it is resolved and
-//! loaded the first time this backend actually runs. A build that only ever
-//! uses Windows Speech Recognition never touches it.
+
 
 use super::SessionSink;
 use ::vosk::{CompleteResult, DecodingState, Model, Recognizer};
@@ -16,23 +8,13 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-/// Vosk fixes the recognizer sample rate; everything is resampled to this.
 const VOSK_RATE: f32 = 16000.0;
 
-/// RMS (in normalized 0..1 units) below which a frame counts as silence.
 const SILENCE_RMS: f32 = 0.012;
-
-/// How long the input has to stay quiet before we force-finalize whatever
-/// partial text we have. Vosk's own endpointing is conservative, so without
-/// this the assistant feels laggy after the user stops talking.
 const ENDPOINT_SILENCE_MS: u64 = 900;
 
 const MODEL_DIR_NAME: &str = "vosk-model-small-en-us-0.15";
 
-/// Holds the loaded model between sessions.
-///
-/// A failed load is deliberately not cached, so a user who installs the model
-/// and retries doesn't have to restart Theta.
 pub struct ModelCache {
     model: Mutex<Option<Arc<Model>>>,
 }
@@ -78,12 +60,6 @@ impl Default for ModelCache {
     }
 }
 
-/// Resolves the Vosk model directory.
-///
-/// Looks for `vosk-models/vosk-model-small-en-us-0.15` relative to the running
-/// executable (works for `cargo run`/`tauri dev`, where the exe lives in
-/// `target/<profile>/`, by walking up to find `src-tauri`), and also relative
-/// to the crate manifest dir.
 fn resolve_model_path() -> Result<PathBuf, String> {
     const RELATIVE_PATHS: &[&str] = &[
         "src-tauri/vosk-models",
@@ -127,7 +103,6 @@ fn resolve_model_path() -> Result<PathBuf, String> {
     ))
 }
 
-/// Names of available input devices, for the settings panel.
 pub fn list_input_devices() -> Result<Vec<String>, String> {
     let host = cpal::default_host();
     let devices = host
@@ -136,21 +111,16 @@ pub fn list_input_devices() -> Result<Vec<String>, String> {
     Ok(devices.map(|d| d.to_string()).collect())
 }
 
-/// Everything the audio callback touches, in one place.
-///
-/// The original code duplicated this body once per `cpal::SampleFormat`.
-/// Each format branch now only converts its native sample type to
-/// interleaved `f32` and calls [`Pipeline::feed`].
+
 struct Pipeline {
     sink: Arc<SessionSink>,
     recognizer: Arc<Mutex<Recognizer>>,
     channels: usize,
     src_rate: u32,
-    /// Carries the fractional resample offset across callbacks so chunk
-    /// boundaries don't click.
+  
     resample_acc: Mutex<f64>,
     level_tick: AtomicU32,
-    /// Millis-since-epoch of the last frame loud enough to count as speech.
+
     last_voice_ms: AtomicU64,
 }
 
@@ -175,15 +145,11 @@ impl Pipeline {
             return;
         }
 
-        // RMS on the normalized mono signal, before the i16 conversion, so
-        // the silence threshold is a plain 0..1 amplitude.
         let rms = (mono.iter().map(|s| s * s).sum::<f32>() / mono.len() as f32).sqrt();
         if rms > SILENCE_RMS {
             self.last_voice_ms.store(now_ms(), Ordering::Relaxed);
         }
 
-        // Emit a level roughly 1 in every 3 callbacks — enough for a smooth
-        // waveform without flooding the event bridge.
         if self.level_tick.fetch_add(1, Ordering::Relaxed) % 3 == 0 {
             let level = (rms * 4000.0).min(1000.0).round() as i32;
             self.sink.level(level);
@@ -206,8 +172,6 @@ impl Pipeline {
             }
             Ok(_) => {
                 self.sink.partial(rec.partial_result().partial);
-                // Vosk endpoints conservatively. If we're sitting on text and
-                // the room has gone quiet, cut the utterance ourselves.
                 let quiet_for = now_ms().saturating_sub(self.last_voice_ms.load(Ordering::Relaxed));
                 if self.sink.has_partial() && quiet_for > ENDPOINT_SILENCE_MS {
                     if let CompleteResult::Single(result) = rec.final_result() {
@@ -261,7 +225,6 @@ pub fn run(sink: &Arc<SessionSink>, models: &ModelCache) -> Result<(), String> {
     let config: cpal::StreamConfig = supported.into();
     let on_err = |err| eprintln!("[theta] audio stream error: {err}");
 
-    // One arm per native sample format; each converts to f32 and delegates.
     let stream = match sample_format {
         cpal::SampleFormat::F32 => {
             let p = Arc::clone(&pipeline);
@@ -316,8 +279,6 @@ pub fn run(sink: &Arc<SessionSink>, models: &ModelCache) -> Result<(), String> {
     drop(stream);
     sink.level(0);
 
-    // A manual stop can leave audio sitting in Vosk's buffer waiting for
-    // trailing silence that will never come. Flush it.
     if let Ok(mut rec) = recognizer.lock() {
         if let CompleteResult::Single(result) = rec.final_result() {
             sink.publish_final(result.text);
@@ -326,11 +287,6 @@ pub fn run(sink: &Arc<SessionSink>, models: &ModelCache) -> Result<(), String> {
 
     Ok(())
 }
-
-/// Linear resampler, mono f32 in → mono i16 at `dst_rate`.
-///
-/// `acc` holds the leftover fractional read position between calls, which is
-/// what keeps consecutive callbacks from producing a seam.
 fn resample_to_i16(input: &[f32], src_rate: u32, dst_rate: u32, acc: &Mutex<f64>) -> Vec<i16> {
     let to_i16 = |s: f32| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
 

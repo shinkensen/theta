@@ -1,17 +1,4 @@
-//! Speech-to-text lifecycle, shared by every recognition backend.
-//!
-//! Capture and recognition live in the backend modules; this module owns what
-//! must behave the same whichever engine is selected: one session at a time,
-//! generation guarding so a winding-down engine cannot talk over its
-//! replacement, and the event names the frontend subscribes to.
-//!
-//! Events emitted:
-//!   `theta-speech-partial` (String)  — in-progress text, replaces previous
-//!   `theta-speech-result`  (String)  — finalized utterance
-//!   `theta-speech-error`   (String)  — capture/recognizer failure
-//!   `theta-level`          (i32)     — 0..1000 mic level, for the waveform
-//!   `theta-debug`          (String)  — timestamped log line
-//!   `theta-listening`      (bool)    — authoritative listening state
+
 
 pub mod vosk;
 
@@ -34,7 +21,6 @@ pub const LISTENING_EVENT: &str = "theta-listening";
 
 const DEBUG_LOG_LIMIT: usize = 500;
 
-/// `HH:MM:SS.mmm` for debug lines — relative ordering is all we need.
 pub fn now_stamp() -> String {
     let dur = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -87,8 +73,6 @@ impl SttState {
             models: Arc::new(vosk::ModelCache::new()),
         }
     }
-
-    /// Mirror a line to stderr, the ring buffer, and the `theta-debug` stream.
     pub fn log(&self, app: &AppHandle, msg: impl Into<String>) {
         push_log(app, &self.debug_log, msg.into());
     }
@@ -130,11 +114,6 @@ fn push_log(app: &AppHandle, log: &Mutex<Vec<String>>, msg: String) {
     let _ = app.emit(DEBUG_EVENT, entry);
 }
 
-/// The handle a backend uses to report progress.
-///
-/// Every emit is gated on the session still being the current one, so a
-/// recognizer that is still shutting down cannot overwrite transcripts or the
-/// listening state belonging to its successor.
 pub struct SessionSink {
     app: AppHandle,
     generation: u64,
@@ -213,13 +192,6 @@ fn unsupported(provider: SpeechProvider) -> String {
     format!("{} isn't available on this platform.", provider.label())
 }
 
-/// Starts capture on a background thread. Idempotent: a second call while
-/// already listening is a no-op rather than an error, so a double-tapped
-/// hotkey doesn't surface a spurious failure in the UI.
-///
-/// This is the plain-function form so the tray menu and the Rust-side global
-/// shortcut can start listening without a `tauri::State` handle; the
-/// `#[tauri::command]` below is a thin wrapper over it.
 pub fn start(app_handle: &AppHandle, state: &SttState) -> Result<(), String> {
     let provider = provider_for(app_handle);
     if !provider.is_supported() {
@@ -258,10 +230,6 @@ pub fn start(app_handle: &AppHandle, state: &SttState) -> Result<(), String> {
     let app_for_thread = app_handle.clone();
 
     std::thread::spawn(move || {
-        // Sessions take turns on the microphone: a replacement engine waits
-        // for its predecessor to let go rather than fighting it for the
-        // device. By the time the lock is free the older session has already
-        // been superseded, so it exits without touching any hardware.
         let held = guard(&capture);
         let outcome = if sink.is_cancelled() {
             Ok(())
@@ -300,8 +268,6 @@ fn run_windows(sink: &Arc<SessionSink>) -> Result<(), String> {
 fn run_windows(_sink: &Arc<SessionSink>) -> Result<(), String> {
     Err(unsupported(SpeechProvider::Windows))
 }
-
-/// Signals the capture thread to wind down. Also plain-function form.
 pub fn stop(app_handle: &AppHandle, state: &SttState) {
     let cancel = {
         let mut session = guard(&state.session);
@@ -316,9 +282,6 @@ pub fn stop(app_handle: &AppHandle, state: &SttState) {
     let _ = app_handle.emit(PARTIAL_EVENT, "");
     let _ = app_handle.emit(LISTENING_EVENT, false);
 }
-
-/// Ends whatever session is running, for callers that only hold an
-/// `AppHandle` — notably a settings save that switches engines.
 pub fn stop_active_session(app_handle: &AppHandle) {
     if let Some(state) = app_handle.try_state::<SttState>() {
         stop(app_handle, &state);
@@ -343,7 +306,6 @@ fn finish_session(app_handle: &AppHandle, generation: u64) {
     let _ = app_handle.emit(LISTENING_EVENT, false);
 }
 
-/// Flips listening on or off. Used by the tray menu and global shortcut.
 pub fn toggle(app_handle: &AppHandle, state: &SttState) -> Result<bool, String> {
     let active = state.is_active();
     if active {
@@ -380,13 +342,11 @@ pub fn get_debug_log(state: State<'_, SttState>) -> Vec<String> {
     guard(&state.debug_log).clone()
 }
 
-/// Names of available input devices, for the settings panel.
 #[tauri::command]
 pub fn list_input_devices() -> Result<Vec<String>, String> {
     vosk::list_input_devices()
 }
 
-/// Which engines this build can actually run, so the UI can disable the rest.
 #[tauri::command]
 pub fn speech_providers() -> Vec<ProviderCapability> {
     [SpeechProvider::Vosk, SpeechProvider::Windows]

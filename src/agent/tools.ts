@@ -27,6 +27,8 @@ export interface Settings {
   allowWeb: boolean;
   autoApprove: boolean;
   calendarId: string;
+  customApiUrl?: string;
+  customApiKey?: string;
 }
 
 export interface EventInput {

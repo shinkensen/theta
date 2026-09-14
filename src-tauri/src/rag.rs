@@ -1,38 +1,19 @@
-//! Local retrieval store — the RAG half of the assistant.
-//!
-//! Deliberately embedding-free: nothing to download, no network call on the
-//! retrieval path. Ranking fuses two cheap signals that fail differently:
-//!
-//! * **BM25** over stemmed word tokens — strong on exact terminology.
-//! * **Character-trigram cosine** — survives the mangled words a small Vosk
-//!   model produces ("kubernetes" → "cooper netties").
-//!
-//! The two rankings are combined with reciprocal rank fusion and then nudged
-//! by recency. Only documents are persisted; the index is rebuilt at load,
-//! which keeps the file small and lets the tokenizer change without a
-//! migration step.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// Target characters per chunk, and the overlap that keeps a fact spanning a
-/// boundary retrievable from either side.
 const CHUNK_CHARS: usize = 900;
 const CHUNK_OVERLAP: usize = 150;
 
-/// Standard BM25 tuning; not tuned per-corpus.
 const BM25_K1: f32 = 1.2;
 const BM25_B: f32 = 0.75;
 
-/// RRF damping constant from Cormack et al.
 const RRF_K: f32 = 60.0;
 
-/// Candidates each ranker contributes before fusion.
 const CANDIDATES: usize = 40;
 
-/// Refuse to ingest anything larger than this, to keep the index in memory.
 const MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 const STOPWORDS: &[&str] = &[
@@ -42,17 +23,14 @@ const STOPWORDS: &[&str] = &[
     "was", "were", "what", "when", "which", "who", "will", "with", "you", "your",
 ];
 
-/// Strips one suffix, longest-match first. `None` when nothing applies.
 fn strip_once(w: &str) -> Option<&str> {
     for suffix in ["edly", "ing", "ly", "es", "ed", "s"] {
-        // Keep at least three characters so short words aren't gutted.
+      
         if w.len() <= suffix.len() + 2 || !w.ends_with(suffix) {
             continue;
         }
         let base = &w[..w.len() - suffix.len()];
-        // "address" and "press" must keep their double s. Note this only
-        // blocks the bare `s`: for `es` a trailing s is the "classes" →"class"
-        // case, which is exactly what we want.
+     
         if suffix == "s" && base.ends_with('s') {
             continue;
         }
@@ -61,12 +39,7 @@ fn strip_once(w: &str) -> Option<&str> {
     None
 }
 
-/// Very light suffix stripping — enough to make "meetings"/"meeting" and
-/// "running"/"run" collide without pulling in a full Porter stemmer.
-///
-/// Two passes, because one is not enough: "meetings" only loses its plural on
-/// the first pass, while "meeting" goes straight to "meet", so a single-pass
-/// stemmer makes the two spellings *fail* to collide.
+
 fn stem(word: &str) -> String {
     let mut w = word;
     for _ in 0..2 {
@@ -76,9 +49,7 @@ fn stem(word: &str) -> String {
         }
     }
 
-    // Porter's undoubling rule: "running" → "runn" → "run". Vowels plus l/s/z
-    // are excluded because "see", "fall", "press" and "buzz" are real words.
-    // Both bytes being ASCII means len-1 is a valid char boundary.
+
     let bytes = w.as_bytes();
     if bytes.len() > 3 {
         let (prev, last) = (bytes[bytes.len() - 2], bytes[bytes.len() - 1]);
@@ -92,7 +63,6 @@ fn stem(word: &str) -> String {
     w.to_string()
 }
 
-/// Lowercase, split on non-alphanumerics, drop stopwords, stem.
 fn tokenize(text: &str) -> Vec<String> {
     text.to_lowercase()
         .split(|c: char| !c.is_alphanumeric())
@@ -101,7 +71,6 @@ fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Character trigrams of the whitespace-collapsed lowercase text.
 fn trigrams(text: &str) -> HashMap<String, f32> {
     let cleaned: String = text
         .to_lowercase()
@@ -122,7 +91,7 @@ fn trigrams(text: &str) -> HashMap<String, f32> {
     for window in chars.windows(3) {
         *counts.entry(window.iter().collect()).or_insert(0.0) += 1.0;
     }
-    // L2-normalize so cosine is a plain dot product later.
+
     let norm = counts.values().map(|v| v * v).sum::<f32>().sqrt();
     if norm > 0.0 {
         for v in counts.values_mut() {
@@ -135,18 +104,18 @@ fn trigrams(text: &str) -> HashMap<String, f32> {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Doc {
     pub id: String,
-    /// Where this came from: a file path, `"note"`, `"conversation"`, …
+  
     pub source: String,
-    /// Human-facing label shown in the memory panel.
+   
     pub title: String,
     pub text: String,
-    /// Unix seconds.
+   
     pub created: i64,
     #[serde(default)]
     pub tags: Vec<String>,
 }
 
-/// Per-document derived state. Rebuilt on load, never serialized.
+
 struct Indexed {
     term_freqs: HashMap<String, f32>,
     len: f32,
@@ -167,7 +136,7 @@ pub struct RagState {
 struct RagIndex {
     docs: Vec<Doc>,
     indexed: Vec<Indexed>,
-    /// term → document positions, for BM25 scoring without a full scan.
+  
     postings: HashMap<String, Vec<usize>>,
     avg_len: f32,
 }
@@ -191,7 +160,6 @@ impl RagIndex {
             self.indexed.push(Indexed {
                 term_freqs,
                 len: tokens.len() as f32,
-                // Index the title too — it's often where the useful keyword is.
                 trigrams: trigrams(&format!("{} {}", doc.title, doc.text)),
             });
         }
@@ -212,8 +180,7 @@ impl RagIndex {
                 continue;
             };
             let df = posting.len() as f32;
-            // BM25 IDF, floored at 0 so terms in most documents can't
-            // subtract from a score.
+            
             let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln().max(0.0);
             for &doc_i in posting {
                 let entry = &self.indexed[doc_i];
@@ -244,8 +211,7 @@ impl RagIndex {
             .iter()
             .enumerate()
             .map(|(i, entry)| {
-                // Both sides are L2-normalized, so the dot product is cosine.
-                // Iterate the shorter map.
+                
                 let (small, large) = if q.len() < entry.trigrams.len() {
                     (&q, &entry.trigrams)
                 } else {
@@ -276,7 +242,7 @@ fn new_id() -> String {
 }
 
 impl RagState {
-    /// Loads the store from `<app-data>/rag.json`, or starts empty.
+   
     pub fn load(dir: &Path) -> Self {
         let path = dir.join("rag.json");
         let docs = std::fs::read_to_string(&path)
@@ -319,8 +285,6 @@ impl RagState {
     }
 }
 
-/// Splits text into overlapping chunks, preferring paragraph and then
-/// sentence boundaries so a chunk rarely starts mid-thought.
 fn chunk_text(text: &str) -> Vec<String> {
     let text = text.trim();
     if text.is_empty() {
@@ -339,7 +303,7 @@ fn chunk_text(text: &str) -> Vec<String> {
         let mut end = hard_end;
 
         if hard_end < chars.len() {
-            // Look back over the last third for a clean break.
+           
             let window_start = start + (CHUNK_CHARS * 2 / 3);
             let slice = &chars[window_start..hard_end];
             let break_at = slice.iter().rposition(|&c| c == '\n').or_else(|| {
@@ -374,7 +338,6 @@ pub struct IngestResult {
     pub title: String,
 }
 
-/// Chunks and indexes raw text. `title`/`source`/`tags` are metadata only.
 #[tauri::command]
 pub fn rag_ingest_text(
     text: String,
@@ -392,7 +355,7 @@ pub fn rag_ingest_text(
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| {
-            // Fall back to the first line, clipped.
+          
             let first = text
                 .lines()
                 .find(|l| !l.trim().is_empty())
@@ -429,7 +392,6 @@ pub fn rag_ingest_text(
     })
 }
 
-/// Reads a UTF-8 text file off disk and ingests it, tagged with its path.
 #[tauri::command]
 pub fn rag_ingest_file(
     path: String,
@@ -454,7 +416,7 @@ pub fn rag_ingest_file(
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| path.clone());
 
-    // Re-ingesting a file replaces its previous chunks rather than duplicating.
+
     {
         let mut index = state.inner.lock().map_err(|e| e.to_string())?;
         let before = index.docs.len();
@@ -482,9 +444,6 @@ pub struct SearchHit {
     pub score: f32,
     pub created: i64,
 }
-
-/// Hybrid retrieval: BM25 + trigram cosine, fused by reciprocal rank, then
-/// nudged toward recent documents.
 #[tauri::command]
 pub fn rag_search(
     query: String,
@@ -500,8 +459,6 @@ pub fn rag_search(
     let lexical = index.bm25(&terms);
     let fuzzy = index.trigram_cosine(&query);
 
-    // Reciprocal rank fusion: 1/(k + rank). Robust to the two rankers having
-    // completely different score scales.
     let mut fused: HashMap<usize, f32> = HashMap::new();
     for (rank, (doc_i, _)) in lexical.iter().enumerate() {
         *fused.entry(*doc_i).or_insert(0.0) += 1.0 / (RRF_K + rank as f32 + 1.0);
@@ -512,8 +469,6 @@ pub fn rag_search(
     if fused.is_empty() {
         return Ok(Vec::new());
     }
-
-    // Recency: full boost for today, decaying to nothing over ~60 days.
     let now = now_secs();
     let mut ranked: Vec<(usize, f32)> = fused
         .into_iter()
@@ -575,7 +530,6 @@ pub struct DocSummary {
     pub tags: Vec<String>,
 }
 
-/// Newest-first listing for the memory panel.
 #[tauri::command]
 pub fn rag_list(
     limit: Option<usize>,
@@ -598,8 +552,6 @@ pub fn rag_list(
         .collect())
 }
 
-/// Deletes by document id, or every chunk sharing a source. Exactly one of
-/// the two must be supplied.
 #[tauri::command]
 pub fn rag_forget(
     id: Option<String>,
@@ -646,13 +598,11 @@ mod tests {
 
     #[test]
     fn stemming_collapses_common_suffixes() {
-        // The point of the two-pass design: both spellings land on one stem.
         assert_eq!(stem("meetings"), stem("meeting"));
         assert_eq!(stem("meeting"), "meet");
         assert_eq!(stem("running"), "run");
         assert_eq!(stem("deployments"), stem("deployment"));
 
-        // Short words and awkward endings are left alone.
         assert_eq!(stem("run"), "run");
         assert_eq!(stem("is"), "is");
         assert_eq!(stem("address"), "address");
@@ -714,7 +664,6 @@ mod tests {
         });
         index.rebuild();
 
-        // BM25 gets nothing from a misheard token; trigrams still rank it.
         assert!(index.bm25(&tokenize("kubernete deploymen")).is_empty());
         let fuzzy = index.trigram_cosine("kubernete deploymen");
         assert_eq!(fuzzy.first().map(|(i, _)| *i), Some(0));

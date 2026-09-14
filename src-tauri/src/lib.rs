@@ -1,24 +1,8 @@
-//! Theta — a local-first voice assistant.
-//!
-//! The Rust side owns everything that has to work whether or not the window is
-//! visible, plus everything that would be slow or unsafe in the webview:
-//!
-//! | module      | what it does                                              |
-//! |-------------|-----------------------------------------------------------|
-//! | [`stt`]     | speech-to-text via Vosk or Windows Speech Recognition     |
-//! | [`rag`]     | local hybrid retrieval (BM25 + character trigrams)        |
-//! | [`procs`]   | process / system / port inspection, shell commands        |
-//! | [`calendar`]| Google Calendar OAuth + v3 CRUD                           |
-//! | [`settings`]| persisted preferences (hotkey, voice, model, …)            |
-//!
-//! The frontend is a chat UI plus an agent loop that calls these as tools.
-//!
-//! Background operation is the reason the global shortcut and tray live here
-//! rather than in the webview: a shortcut registered from JS only fires while
-//! the window has focus, which defeats the point.
+
 
 pub mod calendar;
 pub mod canvas;
+pub mod conversations;
 pub mod integrations;
 pub mod procs;
 pub mod profile;
@@ -31,13 +15,7 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent}
 use tauri::{AppHandle, Emitter, Manager, WindowEvent};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
-/// The one window Theta has. Used everywhere instead of `get_focused_window`,
-/// which is `None` exactly when we care most (hidden or unfocused).
 const MAIN_WINDOW: &str = "main";
-
-// ---------------------------------------------------------------------------
-// Misc commands the frontend still uses
-// ---------------------------------------------------------------------------
 
 #[tauri::command]
 fn read_file_content(path: String) -> Result<String, String> {
@@ -73,14 +51,11 @@ fn list_directory(path: String) -> Result<Vec<String>, String> {
     Ok(result)
 }
 
-/// Brings the window back from the tray. Also used by the hotkey handler.
 #[tauri::command]
 fn show_window(app: AppHandle) -> Result<(), String> {
     reveal(&app);
     Ok(())
 }
-
-/// Hides to tray without quitting — what the titlebar's close button calls.
 #[tauri::command]
 fn hide_to_tray(app: AppHandle) -> Result<(), String> {
     if let Some(win) = app.get_webview_window(MAIN_WINDOW) {
@@ -95,13 +70,6 @@ fn quit_app(app: AppHandle) {
     app.exit(0);
 }
 
-// ---------------------------------------------------------------------------
-// Window / tray / hotkey plumbing
-// ---------------------------------------------------------------------------
-
-/// Show + unminimize + focus, in that order. Windows will not focus a hidden
-/// window, and `set_focus` on a minimized one is a no-op, so all three are
-/// needed for a reliable "summon" from the tray or hotkey.
 fn reveal(app: &AppHandle) {
     if let Some(win) = app.get_webview_window(MAIN_WINDOW) {
         let _ = win.show();
@@ -110,10 +78,6 @@ fn reveal(app: &AppHandle) {
     }
 }
 
-/// The hotkey's job: bring Theta up and start listening in one press.
-///
-/// If the window is already up *and* the mic is live, the same press stops
-/// listening — so it acts as push-to-talk you don't have to hold.
 fn on_hotkey(app: &AppHandle) {
     let was_visible = app
         .get_webview_window(MAIN_WINDOW)
@@ -129,9 +93,6 @@ fn on_hotkey(app: &AppHandle) {
         .try_state::<settings::SettingsState>()
         .map(|s| s.snapshot().auto_listen_on_show)
         .unwrap_or(true);
-
-    // Revealing a hidden window shouldn't also stop an in-flight recording,
-    // so only toggle when the window was already on screen.
     let result = if !was_visible {
         if auto_listen {
             stt::start(app, &stt)
@@ -147,13 +108,10 @@ fn on_hotkey(app: &AppHandle) {
     }
 }
 
-/// Re-registers the global shortcut when the user changes it in Settings.
-/// Called from [`settings::save_settings`].
+
 pub fn rebind_hotkey(app: &AppHandle, previous: &str, next: &str) -> Result<(), String> {
     let shortcuts = app.global_shortcut();
 
-    // Register first: if `next` is unparseable or already owned by another
-    // app, we bail out with the old binding still live.
     shortcuts
         .on_shortcut(next, |app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
@@ -167,8 +125,6 @@ pub fn rebind_hotkey(app: &AppHandle, previous: &str, next: &str) -> Result<(), 
     }
     Ok(())
 }
-
-/// Flips the OS "run at login" entry.
 pub fn set_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
     use tauri_plugin_autostart::ManagerExt;
     let manager = app.autolaunch();
@@ -210,8 +166,6 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let mut builder = TrayIconBuilder::with_id("theta-tray")
         .tooltip("Theta — press Ctrl+Shift+Space to talk")
         .menu(&menu)
-        // Left click summons the window; the menu stays on right click, which
-        // is what people expect from a tray icon on Windows.
         .show_menu_on_left_click(false)
         .on_menu_event(on_tray_menu_event)
         .on_tray_icon_event(|tray, event| {
@@ -233,10 +187,6 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// App entry point
-// ---------------------------------------------------------------------------
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -244,15 +194,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            // Launching at login should land in the tray, not pop a window in
-            // the user's face; the frontend reads this argv flag.
+         
             Some(vec!["--hidden"]),
         ))
         .manage(stt::SttState::new())
         .manage(procs::ProcState::new())
         .setup(|app| {
-            // RAG and OAuth tokens are per-user state, so they live in the
-            // platform app-data dir rather than next to the binary.
+      
             let data_dir = app
                 .path()
                 .app_data_dir()
@@ -274,19 +222,19 @@ pub fn run() {
             app.manage(integrations::notion::NotionState::load(&data_dir));
             app.manage(integrations::minestrator::MineStratorState::load(&data_dir));
             app.manage(integrations::api_keys::ApiKeyState::load(&data_dir));
+            app.manage(conversations::ConversationState::new(&data_dir).expect("Failed to initialize conversation state"));
             app.manage(settings);
 
             let handle = app.handle();
             if let Err(e) = rebind_hotkey(handle, "", &hotkey) {
-                // A taken hotkey is annoying, not fatal — the in-app mic
-                // button still works.
+                
                 eprintln!("[theta] {e}");
             }
             if let Err(e) = build_tray(handle) {
                 eprintln!("[theta] tray icon unavailable: {e}");
             }
 
-            // `--hidden` comes from the autostart entry.
+          
             if std::env::args().any(|a| a == "--hidden") {
                 if let Some(win) = app.get_webview_window(MAIN_WINDOW) {
                     let _ = win.hide();
@@ -308,14 +256,14 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            // files + window
+          
             read_file_content,
             write_file_content,
             list_directory,
             show_window,
             hide_to_tray,
             quit_app,
-            // speech
+          
             stt::start_listening,
             stt::stop_listening,
             stt::toggle_listening,
@@ -323,25 +271,25 @@ pub fn run() {
             stt::get_debug_log,
             stt::list_input_devices,
             stt::speech_providers,
-            // processes / terminal
+            
             procs::list_processes,
             procs::system_stats,
             procs::kill_process,
             procs::listening_ports,
             procs::run_command,
-            // retrieval
+           
             rag::rag_ingest_text,
             rag::rag_ingest_file,
             rag::rag_search,
             rag::rag_stats,
             rag::rag_list,
             rag::rag_forget,
-            // evolving user profile
+            
             profile::profile_get,
             profile::profile_apply,
             profile::profile_remove,
             profile::profile_clear,
-            // calendar
+            
             calendar::google_auth_status,
             calendar::google_set_credentials,
             calendar::google_connect,
@@ -352,7 +300,7 @@ pub fn run() {
             calendar::calendar_update_event,
             calendar::calendar_delete_event,
             calendar::calendar_quick_add,
-            // Canvas LMS
+      
             canvas::canvas_status,
             canvas::canvas_save_config,
             canvas::canvas_disconnect,
@@ -362,7 +310,7 @@ pub fn run() {
             canvas::canvas_list_due_dates,
             canvas::canvas_list_modules,
             canvas::canvas_list_module_items,
-            // Spotify
+        
             integrations::spotify::spotify_status,
             integrations::spotify::spotify_set_client_id,
             integrations::spotify::spotify_connect,
@@ -375,7 +323,7 @@ pub fn run() {
             integrations::spotify::spotify_previous,
             integrations::spotify::spotify_seek,
             integrations::spotify::spotify_set_volume,
-            // Hackatime
+         
             integrations::hackatime::hackatime_status,
             integrations::hackatime::hackatime_set_client_id,
             integrations::hackatime::hackatime_connect,
@@ -385,7 +333,7 @@ pub fn run() {
             integrations::hackatime::hackatime_get_streak,
             integrations::hackatime::hackatime_list_projects,
             integrations::hackatime::hackatime_latest_heartbeat,
-            // GitHub
+       
             integrations::github::github_status,
             integrations::github::github_set_client_id,
             integrations::github::github_begin_device_flow,
@@ -397,7 +345,7 @@ pub fn run() {
             integrations::github::github_search_issues,
             integrations::github::github_create_issue,
             integrations::github::github_comment_issue,
-            // Gmail
+        
             integrations::gmail::gmail_status,
             integrations::gmail::gmail_set_client_id,
             integrations::gmail::gmail_connect,
@@ -409,20 +357,20 @@ pub fn run() {
             integrations::gmail::gmail_create_draft,
             integrations::gmail::gmail_send_message,
             integrations::gmail::gmail_modify_message,
-            // Notion hosted MCP
+        
             integrations::notion::notion_status,
             integrations::notion::notion_connect,
             integrations::notion::notion_disconnect,
             integrations::notion::notion_list_tools,
             integrations::notion::notion_call_tool,
-            // MineStrator hosted MCP
+      
             integrations::minestrator::minestrator_status,
             integrations::minestrator::minestrator_save_config,
             integrations::minestrator::minestrator_connect,
             integrations::minestrator::minestrator_disconnect,
             integrations::minestrator::minestrator_list_tools,
             integrations::minestrator::minestrator_call_tool,
-            // OpenRouter + Firecrawl API keys
+        
             integrations::api_keys::openrouter_status,
             integrations::api_keys::openrouter_save_key,
             integrations::api_keys::openrouter_get_key,
@@ -430,9 +378,17 @@ pub fn run() {
             integrations::api_keys::firecrawl_status,
             integrations::api_keys::firecrawl_save_key,
             integrations::api_keys::firecrawl_get_key,
-            // settings
+      
             settings::get_settings,
             settings::save_settings,
+      
+            conversations::conversation_create,
+            conversations::conversation_save,
+            conversations::conversation_load,
+            conversations::conversation_list,
+            conversations::conversation_delete,
+            conversations::conversation_set_current,
+            conversations::conversation_get_current,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,14 +1,4 @@
-//! Google Calendar, via an installed-app OAuth 2.0 flow with PKCE.
-//!
-//! The flow is the loopback variant: we bind an ephemeral port on
-//! 127.0.0.1, send the user to Google's consent screen with that port as the
-//! redirect URI, and read the authorization code out of the single request
-//! Google's redirect makes back to us. No embedded webview, no client secret
-//! in the frontend bundle, and nothing to configure in the code — the client
-//! id/secret are entered once in Settings and persisted next to the tokens.
-//!
-//! Tokens live in `<app-data>/google_auth.json`. Access tokens are refreshed
-//! automatically when they are within [`REFRESH_SKEW_SECS`] of expiring.
+
 
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
@@ -24,10 +14,8 @@ const SCOPE: &str = "https://www.googleapis.com/auth/calendar";
 const DEFAULT_CLIENT_ID: &str = "194132598772-klc5e34n4qqksjf5j1o2a85rt3qj9jk6.apps.googleusercontent.com";
 const DEFAULT_CLIENT_SECRET: &str = "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";
 
-/// Refresh this many seconds before actual expiry.
 const REFRESH_SKEW_SECS: i64 = 120;
 
-/// How long to wait for the user to finish the consent screen.
 const CONSENT_TIMEOUT_SECS: u64 = 300;
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -36,7 +24,6 @@ struct AuthFile {
     client_secret: Option<String>,
     refresh_token: Option<String>,
     access_token: Option<String>,
-    /// Unix seconds.
     expires_at: Option<i64>,
     email: Option<String>,
 }
@@ -87,8 +74,6 @@ impl CalendarState {
         self.persist(&snapshot)?;
         Ok(snapshot)
     }
-
-    /// Returns a valid bearer token, refreshing first if it's expiring.
     async fn access_token(&self) -> Result<String, String> {
         let auth = self.snapshot()?;
         let now = chrono::Utc::now().timestamp();
@@ -150,7 +135,6 @@ impl CalendarState {
     }
 }
 
-/// Google error bodies can be long; keep enough to be actionable.
 fn clip_error(body: &str) -> String {
     let trimmed = body.trim();
     if trimmed.chars().count() <= 400 {
@@ -164,7 +148,6 @@ fn b64url(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// PKCE S256 pair: a random verifier and its SHA-256 challenge.
 fn pkce_pair() -> (String, String) {
     use rand::Rng;
     use sha2::{Digest, Sha256};
@@ -194,7 +177,6 @@ pub struct AuthStatus {
 pub fn google_auth_status(state: tauri::State<'_, CalendarState>) -> Result<AuthStatus, String> {
     let mut auth = state.snapshot()?;
     
-    // Auto-configure with default credentials if not set
     if auth.client_id.is_none() {
         state.update(|a| {
             a.client_id = Some(DEFAULT_CLIENT_ID.to_string());
@@ -210,8 +192,6 @@ pub fn google_auth_status(state: tauri::State<'_, CalendarState>) -> Result<Auth
     })
 }
 
-/// Stores the OAuth client id/secret from Settings. Changing the client id
-/// invalidates any existing tokens, so those are cleared.
 #[tauri::command]
 pub fn google_set_credentials(
     client_id: String,
@@ -254,7 +234,6 @@ pub fn google_disconnect(state: tauri::State<'_, CalendarState>) -> Result<(), S
     Ok(())
 }
 
-/// The single HTTP request Google's redirect makes back to us.
 struct CallbackResult {
     code: Option<String>,
     state: Option<String>,
@@ -268,7 +247,6 @@ place-items:center;height:100vh;margin:0\"><div style=\"text-align:center\">\
 <h2 style=\"font-weight:600\">Theta is connected.</h2>\
 <p style=\"color:#a0a4ab\">You can close this tab.</p></div>";
 
-/// Waits for the redirect, replies with a small page, returns the query params.
 fn await_callback(listener: &TcpListener, timeout_secs: u64) -> Result<CallbackResult, String> {
     listener
         .set_nonblocking(true)
@@ -303,7 +281,6 @@ fn await_callback(listener: &TcpListener, timeout_secs: u64) -> Result<CallbackR
                 );
                 let _ = stream.flush();
 
-                // `GET /?code=...&state=... HTTP/1.1`
                 let target = request_line.split_whitespace().nth(1).unwrap_or("");
                 let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
                 let mut result = CallbackResult {
@@ -338,11 +315,6 @@ fn await_callback(listener: &TcpListener, timeout_secs: u64) -> Result<CallbackR
     }
 }
 
-/// Runs the full consent flow and stores the resulting refresh token.
-///
-/// Opens the system browser, waits for the redirect on a loopback port, then
-/// exchanges the code. Returns the connected account's email when Google
-/// includes one in the id token.
 #[tauri::command]
 pub async fn google_connect(
     app: tauri::AppHandle,
@@ -454,11 +426,6 @@ pub async fn google_connect(
     Ok(email.unwrap_or_else(|| "connected".to_string()))
 }
 
-/// Reads the `email` claim out of an id token's payload.
-///
-/// The token comes straight from Google's TLS-authenticated token endpoint,
-/// so this is a display convenience, not a security decision — no signature
-/// verification is needed or performed.
 fn email_from_id_token(id_token: &str) -> Option<String> {
     use base64::Engine;
     let payload = id_token.split('.').nth(1)?;
@@ -469,18 +436,13 @@ fn email_from_id_token(id_token: &str) -> Option<String> {
     claims.get("email")?.as_str().map(|s| s.to_string())
 }
 
-// ---------------------------------------------------------------------------
-// Calendar v3
-// ---------------------------------------------------------------------------
-
-/// A flattened event, shaped for both the UI table and the LLM's tool result.
 #[derive(Serialize, Clone)]
 pub struct CalEvent {
     pub id: String,
     pub summary: String,
     pub description: Option<String>,
     pub location: Option<String>,
-    /// RFC 3339 for timed events, `YYYY-MM-DD` for all-day ones.
+
     pub start: String,
     pub end: String,
     pub all_day: bool,
@@ -498,8 +460,6 @@ pub struct CalendarSummary {
     pub access_role: Option<String>,
 }
 
-/// One place where every Calendar API call runs, so auth, status handling and
-/// error text stay consistent.
 async fn api_call(
     state: &CalendarState,
     method: reqwest::Method,
@@ -511,7 +471,7 @@ async fn api_call(
     if let Some(payload) = body {
         req = req.json(&payload);
     } else if method == reqwest::Method::POST {
-        // Some Google frontends reject bodyless POSTs unless the length is explicit.
+      
         req = req.header(reqwest::header::CONTENT_LENGTH, 0);
     }
 
@@ -523,8 +483,7 @@ async fn api_call(
     let text = res.text().await.unwrap_or_default();
 
     if !status.is_success() {
-        // Pull Google's own message out when present — it's far more useful
-        // than the bare status.
+
         let detail = serde_json::from_str::<serde_json::Value>(&text)
             .ok()
             .and_then(|v| {
@@ -549,7 +508,7 @@ async fn api_call(
 
 fn parse_event(raw: &serde_json::Value, calendar_id: &str) -> Option<CalEvent> {
     let id = raw.get("id")?.as_str()?.to_string();
-    // All-day events carry `date`; timed ones carry `dateTime`.
+   
     let pick = |key: &str| -> (String, bool) {
         let node = raw.get(key);
         let date_time = node
@@ -647,12 +606,6 @@ pub async fn calendar_list_calendars(
         .unwrap_or_default())
 }
 
-/// Lists events in a window.
-///
-/// `time_min`/`time_max` accept either RFC 3339 or a bare `YYYY-MM-DD`, which
-/// is expanded to that day in the machine's local timezone — the LLM reliably
-/// produces plain dates, and interpreting them as UTC would shift events
-/// across day boundaries for anyone not on UTC.
 #[tauri::command]
 pub async fn calendar_list_events(
     time_min: Option<String>,
@@ -692,12 +645,6 @@ pub async fn calendar_list_events(
         .unwrap_or_default())
 }
 
-/// Normalizes a caller-supplied instant to RFC 3339 with an offset.
-///
-/// * `None`             → now (or now + 7 days when `end_of_day`)
-/// * `YYYY-MM-DD`       → local midnight, or 23:59:59 local when `end_of_day`
-/// * RFC 3339           → parsed and normalized
-/// * offsetless date-time → interpreted in the machine's local timezone
 fn to_rfc3339(value: Option<&str>, end_of_day: bool) -> Result<String, String> {
     use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone};
 
@@ -743,34 +690,24 @@ fn to_rfc3339(value: Option<&str>, end_of_day: bool) -> Result<String, String> {
     ))
 }
 
-/// What the UI and the LLM send when creating or editing an event.
-///
-/// Everything except `summary` is optional so the same struct can drive a
-/// `PATCH`, where omitted fields must stay untouched on Google's side.
 #[derive(Deserialize, Default)]
 pub struct EventInput {
     pub summary: Option<String>,
     pub description: Option<String>,
     pub location: Option<String>,
-    /// RFC 3339, `YYYY-MM-DDTHH:MM(:SS)` (assumed local), or `YYYY-MM-DD`.
+  
     pub start: Option<String>,
     pub end: Option<String>,
     #[serde(default)]
     pub all_day: bool,
     pub attendees: Option<Vec<String>>,
 }
-
-/// Builds a Calendar v3 `start`/`end` node from loose user/LLM input.
-///
-/// Timed events are sent as `dateTime` carrying an explicit UTC offset and no
-/// `timeZone`, which is the one combination that can't be misinterpreted —
-/// naming an IANA zone would mean shipping a whole tz database.
 fn event_time(raw: &str, all_day: bool) -> Result<serde_json::Value, String> {
     use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone};
 
     let raw = raw.trim();
     if all_day {
-        // Accept a full timestamp here too and just keep the date part.
+        
         let date = NaiveDate::parse_from_str(&raw[..raw.len().min(10)], "%Y-%m-%d")
             .map_err(|_| format!("'{raw}' isn't a date I can read (want YYYY-MM-DD)."))?;
         return Ok(serde_json::json!({ "date": date.to_string() }));
@@ -780,7 +717,7 @@ fn event_time(raw: &str, all_day: bool) -> Result<serde_json::Value, String> {
         return Ok(serde_json::json!({ "dateTime": dt.to_rfc3339() }));
     }
 
-    // No offset supplied → interpret in the machine's local zone.
+    
     const LOCAL_FORMATS: [&str; 4] = [
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%dT%H:%M",
@@ -804,8 +741,6 @@ fn event_time(raw: &str, all_day: bool) -> Result<serde_json::Value, String> {
         .ok_or_else(|| format!("'{raw}' doesn't exist in the local timezone (DST gap)."))
 }
 
-/// `end` when the caller didn't give one: +1 hour for timed events, +1 day for
-/// all-day ones (Calendar treats an all-day `end` as exclusive).
 fn default_end(start: &serde_json::Value, all_day: bool) -> Result<serde_json::Value, String> {
     use chrono::{DateTime, Duration, NaiveDate};
 
@@ -829,10 +764,6 @@ fn default_end(start: &serde_json::Value, all_day: bool) -> Result<serde_json::V
     Ok(serde_json::json!({ "dateTime": (dt + Duration::hours(1)).to_rfc3339() }))
 }
 
-/// Translates [`EventInput`] into a Calendar v3 event body.
-///
-/// `require_start` is true for creates (Google rejects an event with no start)
-/// and false for patches, where absent fields mean "leave as-is".
 fn event_body(input: &EventInput, require_start: bool) -> Result<serde_json::Value, String> {
     let mut body = serde_json::Map::new();
 
@@ -891,7 +822,7 @@ fn event_body(input: &EventInput, require_start: bool) -> Result<serde_json::Val
             return Err("An event needs a start time.".into());
         }
         None => {
-            // A patch that only moves the end time is legitimate.
+          
             if let Some(e) = input
                 .end
                 .as_deref()
@@ -906,7 +837,6 @@ fn event_body(input: &EventInput, require_start: bool) -> Result<serde_json::Val
     Ok(serde_json::Value::Object(body))
 }
 
-/// Creates an event. Gated behind a confirmation card in the UI.
 #[tauri::command]
 pub async fn calendar_create_event(
     event: EventInput,
@@ -928,7 +858,6 @@ pub async fn calendar_create_event(
     parse_event(&json, &calendar_id).ok_or("Google accepted the event but returned no id.".into())
 }
 
-/// Partial update — `PATCH`, so fields left out of `event` stay as they are.
 #[tauri::command]
 pub async fn calendar_update_event(
     event_id: String,
@@ -957,8 +886,6 @@ pub async fn calendar_update_event(
     .await?;
     parse_event(&json, &calendar_id).ok_or("Google accepted the edit but returned no event.".into())
 }
-
-/// Deletes an event. Returns a sentence the assistant can read back.
 #[tauri::command]
 pub async fn calendar_delete_event(
     event_id: String,
@@ -983,11 +910,6 @@ pub async fn calendar_delete_event(
     Ok("Event deleted.".into())
 }
 
-/// Natural-language create ("lunch with Sam tomorrow at noon").
-///
-/// Google does the parsing, which is more reliable than asking the model to
-/// emit RFC 3339 — but it can't set attendees or descriptions, so the
-/// structured path above still exists.
 #[tauri::command]
 pub async fn calendar_quick_add(
     text: String,
@@ -1021,7 +943,7 @@ mod tests {
     fn all_day_input_becomes_a_date_node() {
         let node = event_time("2026-03-04", true).unwrap();
         assert_eq!(node["date"], "2026-03-04");
-        // A full timestamp is tolerated for all-day events.
+
         let node = event_time("2026-03-04T09:00:00Z", true).unwrap();
         assert_eq!(node["date"], "2026-03-04");
     }
@@ -1031,7 +953,6 @@ mod tests {
         let node = event_time("2026-03-04T14:30", false).unwrap();
         let text = node["dateTime"].as_str().unwrap();
         assert!(text.starts_with("2026-03-04T14:30:00"));
-        // Must be a valid RFC 3339 instant, i.e. it carries an offset or Z.
         assert!(chrono::DateTime::parse_from_rfc3339(text).is_ok());
     }
 
@@ -1051,7 +972,6 @@ mod tests {
                 .to_utc()
         );
 
-        // All-day events get an exclusive next-day end instead.
         let input = EventInput {
             start: Some("2026-03-04".into()),
             all_day: true,
@@ -1068,7 +988,7 @@ mod tests {
             ..Default::default()
         };
         assert!(event_body(&input, false).unwrap()["location"] == "Room 2");
-        // …but a create can't.
+
         assert!(event_body(&input, true).is_err());
     }
 
@@ -1088,7 +1008,7 @@ mod tests {
             chrono::DateTime::parse_from_rfc3339(&end).unwrap(),
         );
         assert!(end > start);
-        // Same calendar day, just under 24h apart.
+      
         assert!((end - start).num_hours() == 23);
     }
 

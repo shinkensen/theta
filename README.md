@@ -5,13 +5,6 @@ Theta is an agentic voice assistant built with React, TypeScript, Rust, and Taur
 
 Microphone -> Vosk or Windows Speech Recognition -> OpenRouter agent -> Tool Calls -> Edge Neural Text to Speech
 
-## Speech recognition
-
-Theta has 2 systems in place for speech recognition:
-
-    1- VOSK (small model, its not super good but its more accessible)
-    2- Windows Default (IMPORTANT NOTE: You must go into settings -> Privcy & Security -> Speech and then turn on online speech recognition)
-
 ## Prerequisites
 - node.js and npm.
 - rust and cargo

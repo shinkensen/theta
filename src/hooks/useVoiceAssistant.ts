@@ -5,12 +5,13 @@ import { runAgent, type AgentMessage } from "../agent/agent";
 import { learnProfile } from "../agent/profile";
 import { speakWithSystemVoice, streamEdgeSpeech, type SpeechHandle, type TtsDiagnostic } from "../voice/edgeTts";
 import type { ConfirmationRequest, ProfileItem, Settings, ToolActivity } from "../agent/tools";
+import type { Conversation } from "../uiTypes";
 
 export type AssistantStatus = "standby" | "listening" | "thinking" | "speaking" | "error";
 export interface TranscriptEntry { id: string; role: "user" | "assistant"; text: string; timestamp: number }
 export interface Toast { id: string; text: string; tone: "info" | "error" | "success" }
 type PendingConfirmation = ConfirmationRequest & { resolve: (approved: boolean) => void };
-const DEFAULT_SETTINGS: Settings = { hotkey: "CommandOrControl+Shift+Space", closeToTray: true, launchAtLogin: false, autoListenOnShow: true, speechRecognitionProvider: "vosk", speakReplies: true, voice: "en-GB-SoniaNeural", model: "openrouter/free", useRag: true, allowWeb: true, autoApprove: false, calendarId: "primary" };
+const DEFAULT_SETTINGS: Settings = { hotkey: "CommandOrControl+Shift+Space", closeToTray: true, launchAtLogin: false, autoListenOnShow: true, speechRecognitionProvider: "vosk", speakReplies: true, voice: "en-GB-SoniaNeural", model: "openrouter/free", useRag: true, allowWeb: true, autoApprove: false, calendarId: "primary", customApiUrl: undefined, customApiKey: undefined };
 function guid(): string { return crypto.randomUUID().replace(/-/g, ""); }
 function errorDetail(error: unknown): string {
   if (error instanceof Error) return error.stack || `${error.name}: ${error.message}`;
@@ -34,9 +35,26 @@ export function useVoiceAssistant() {
   const [errorMessage, setErrorMessage] = useState(""), [debugLogs, setDebugLogs] = useState<string[]>([]), [activities, setActivities] = useState<ToolActivity[]>([]);
   const [confirmation, setConfirmation] = useState<ConfirmationRequest | null>(null), [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS), [toasts, setToasts] = useState<Toast[]>([]);
   const [speechDiagnostic, setSpeechDiagnostic] = useState<TtsDiagnostic | null>(null), [isTestingVoice, setIsTestingVoice] = useState(false);
+  const [currentConversationId, setCurrentConversationId] = useState<string | null>(null);
   const conversationRef = useRef<AgentMessage[]>([]), processingRef = useRef(false), abortRef = useRef<AbortController | null>(null), speechRef = useRef<SpeechHandle | null>(null), profileRef = useRef<ProfileItem[]>([]), confirmationRef = useRef<PendingConfirmation | null>(null);
   const toast = useCallback((text: string, tone: Toast["tone"] = "info") => { const id = guid(); setToasts((v) => [...v, { id, text, tone }]); window.setTimeout(() => setToasts((v) => v.filter((item) => item.id !== id)), 4500); }, []);
-  const addEntry = useCallback((role: TranscriptEntry["role"], text: string) => setTranscript((v) => [...v, { id: guid(), role, text, timestamp: Date.now() }]), []);
+  const addEntry = useCallback((role: TranscriptEntry["role"], text: string) => {
+    const entry = { id: guid(), role, text, timestamp: Date.now() };
+    setTranscript((v) => [...v, entry]);
+    if (currentConversationId) {
+      setTranscript((current) => {
+        const conversation: Conversation = {
+          id: currentConversationId,
+          title: current.length > 0 ? current[0].text.slice(0, 50) : "New Conversation",
+          created: current[0]?.timestamp || Date.now(),
+          updated: Date.now(),
+          messages: current.map(e => ({ id: e.id, role: e.role, text: e.text, timestamp: e.timestamp }))
+        };
+        void invoke("conversation_save", { conversation }).catch((e) => console.error("Failed to save conversation:", e));
+        return current;
+      });
+    }
+  }, [currentConversationId]);
   const updateActivity = useCallback((next: ToolActivity) => setActivities((items) => {
     const index = items.findIndex((item) => item.callId === next.callId);
     if (next.protected && (next.status === "success" || next.status === "denied")) return index < 0 ? items : items.filter((item) => item.callId !== next.callId);
@@ -106,6 +124,52 @@ export function useVoiceAssistant() {
     return () => { disposed = true; unsubs.forEach((off) => off()); abortRef.current?.abort(); confirmationRef.current?.resolve(false); };
   }, [submitText, toast]);
 
+  useEffect(() => {
+    void invoke<string | null>("conversation_get_current").then((id) => {
+      if (id) {
+        void invoke<Conversation>("conversation_load", { id }).then((conv) => {
+          setCurrentConversationId(conv.id);
+          setTranscript(conv.messages.map(m => ({ id: m.id, role: m.role as "user" | "assistant", text: m.text, timestamp: m.timestamp })));
+        }).catch(() => {
+     
+          void invoke<Conversation>("conversation_create", { title: "New Conversation" }).then((conv) => {
+            setCurrentConversationId(conv.id);
+          });
+        });
+      } else {
+      
+        void invoke<Conversation>("conversation_create", { title: "New Conversation" }).then((conv) => {
+          setCurrentConversationId(conv.id);
+        }).catch((e) => console.error("Failed to create conversation:", e));
+      }
+    });
+  }, []);
+
+  const newConversation = useCallback(async () => {
+    try {
+      const conv = await invoke<Conversation>("conversation_create", { title: "New Conversation" });
+      setCurrentConversationId(conv.id);
+      setTranscript([]);
+      conversationRef.current = [];
+      toast("Started new conversation", "success");
+    } catch (error) {
+      toast(String(error), "error");
+    }
+  }, [toast]);
+
+  const loadConversation = useCallback(async (id: string) => {
+    try {
+      const conv = await invoke<Conversation>("conversation_load", { id });
+      setCurrentConversationId(conv.id);
+      setTranscript(conv.messages.map(m => ({ id: m.id, role: m.role as "user" | "assistant", text: m.text, timestamp: m.timestamp })));
+      conversationRef.current = [];
+      await invoke("conversation_set_current", { id });
+      toast("Conversation loaded", "success");
+    } catch (error) {
+      toast(String(error), "error");
+    }
+  }, [toast]);
+
   const status: AssistantStatus = errorMessage ? "error" : phase !== "idle" ? phase : isListening ? "listening" : "standby";
-  return { status, isListening, level, partial, transcript, errorMessage, debugLogs, activities, confirmation, settings, toasts, speechDiagnostic, isTestingVoice, submitText, toggleListening, testVoice, approve: () => resolveConfirmation(true), deny: () => resolveConfirmation(false), cancel, stopSpeaking: cancel, saveSettings, setErrorMessage };
+  return { status, isListening, level, partial, transcript, errorMessage, debugLogs, activities, confirmation, settings, toasts, speechDiagnostic, isTestingVoice, currentConversationId, submitText, toggleListening, testVoice, approve: () => resolveConfirmation(true), deny: () => resolveConfirmation(false), cancel, stopSpeaking: cancel, saveSettings, setErrorMessage, newConversation, loadConversation };
 }

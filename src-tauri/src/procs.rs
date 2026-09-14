@@ -1,14 +1,9 @@
-//! Process, system-load, port and shell-command inspection.
-//!
-//! Everything here is read-only except [`kill_process`] and [`run_command`],
-//! which the frontend gates behind an explicit confirmation card.
+
 
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
-/// `System` is expensive to construct and CPU usage is a *delta* between two
-/// refreshes, so we keep one instance alive for the process of the app.
 pub struct ProcState {
     sys: Mutex<System>,
 }
@@ -35,32 +30,26 @@ pub struct ProcInfo {
     pub pid: u32,
     pub parent_pid: Option<u32>,
     pub name: String,
-    /// Full command line, joined with spaces. Empty when not readable.
+   
     pub cmd: String,
     pub exe: Option<String>,
-    /// Percent of one core, so this can exceed 100 on multi-threaded procs.
+  
     pub cpu: f32,
     pub memory_mb: f64,
-    /// Seconds the process has been alive.
+ 
     pub run_time: u64,
     pub status: String,
 }
 
 #[derive(Deserialize, Default)]
 pub struct ProcQuery {
-    /// Case-insensitive substring matched against name, exe and cmd.
+
     pub filter: Option<String>,
-    /// `"cpu"` (default), `"memory"`, `"name"`, or `"pid"`.
     pub sort_by: Option<String>,
     pub limit: Option<usize>,
 }
 
-/// Snapshot of running processes.
-///
-/// CPU percentages need two samples taken at least
-/// `MINIMUM_CPU_UPDATE_INTERVAL` apart. The state is long-lived, so on the
-/// second and later calls the previous refresh serves as the first sample;
-/// only the very first call has to sleep.
+
 #[tauri::command]
 pub fn list_processes(
     query: Option<ProcQuery>,
@@ -199,8 +188,7 @@ pub fn system_stats(state: tauri::State<'_, ProcState>) -> Result<SystemStats, S
     })
 }
 
-/// SIGKILL-equivalent. Refuses PID 0 and the app's own PID so a
-/// mistranscribed command can't take Theta down with it.
+
 #[tauri::command]
 pub fn kill_process(pid: u32, state: tauri::State<'_, ProcState>) -> Result<String, String> {
     if pid == 0 {
@@ -241,11 +229,6 @@ pub struct PortInfo {
     pub process: String,
 }
 
-/// TCP/UDP listeners, resolved to owning process names.
-///
-/// Parses `netstat -ano` on Windows and `ss -tulpn` elsewhere rather than
-/// pulling in a raw-socket dependency — the output is stable enough and this
-/// keeps the build free of extra native linkage.
 #[tauri::command]
 pub fn listening_ports(state: tauri::State<'_, ProcState>) -> Result<Vec<PortInfo>, String> {
     let mut rows = if cfg!(target_os = "windows") {
@@ -254,7 +237,7 @@ pub fn listening_ports(state: tauri::State<'_, ProcState>) -> Result<Vec<PortInf
         parse_ss(&run_capture("ss", &["-tulpn"])?)
     };
 
-    // Resolve PIDs to names in one pass.
+    
     if let Ok(mut sys) = state.sys.lock() {
         let pids: Vec<Pid> = rows
             .iter()
@@ -291,7 +274,7 @@ fn run_capture(program: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// `Proto  Local Address  Foreign Address  State  PID`
+
 fn parse_netstat(text: &str) -> Vec<PortInfo> {
     let mut out = Vec::new();
     for line in text.lines() {
@@ -304,7 +287,7 @@ fn parse_netstat(text: &str) -> Vec<PortInfo> {
         if !is_tcp && proto != "UDP" {
             continue;
         }
-        // TCP rows carry a state column; UDP rows don't.
+
         if is_tcp && f.len() >= 4 && f[3] != "LISTENING" {
             continue;
         }
@@ -323,7 +306,6 @@ fn parse_netstat(text: &str) -> Vec<PortInfo> {
     out
 }
 
-/// `Netid State Recv-Q Send-Q Local:Port Peer:Port users:(("name",pid=123,..))`
 fn parse_ss(text: &str) -> Vec<PortInfo> {
     let mut out = Vec::new();
     for line in text.lines().skip(1) {
@@ -378,7 +360,6 @@ fn clip(s: &str) -> String {
     format!("{head}\n[...output truncated...]")
 }
 
-/// Builds a `Command` that does not flash a console window on Windows.
 fn new_command(program: &str) -> std::process::Command {
     #[allow(unused_mut)]
     let mut cmd = std::process::Command::new(program);
@@ -391,11 +372,6 @@ fn new_command(program: &str) -> std::process::Command {
     cmd
 }
 
-/// Runs a shell command and captures its output.
-///
-/// The frontend requires user confirmation before this is ever invoked — see
-/// `REQUIRES_CONFIRMATION` in `src/agent/tools.ts`. Killed after `timeout_secs`
-/// (default 20, max 120) so a hung command can't wedge the assistant.
 #[tauri::command]
 pub async fn run_command(
     command: String,
@@ -429,8 +405,6 @@ pub async fn run_command(
             .spawn()
             .map_err(|e| format!("Failed to start command: {e}"))?;
 
-        // Poll rather than block so we can enforce the timeout without
-        // needing an async process crate.
         let deadline = std::time::Instant::now() + timeout;
         loop {
             match child.try_wait() {

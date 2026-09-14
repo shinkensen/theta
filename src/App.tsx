@@ -4,12 +4,12 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useVoiceAssistant, type AssistantStatus } from "./hooks/useVoiceAssistant";
 import { SpotifyPlayer } from "./components/integrations/SpotifyPlayer";
 import { integrationCards } from "./integrations/registry";
-import type { AuthStatus, CalendarSummary, CalEvent, PortInfo, ProcessInfo, ProfileItem, RagDoc, Settings, SpeechProvider, SpeechProviderCapability, SystemStats } from "./uiTypes";
+import type { AuthStatus, CalendarSummary, CalEvent, PortInfo, ProcessInfo, ProfileItem, RagDoc, Settings, SystemStats } from "./uiTypes";
 import "./App.css";
 
-type View = "chat" | "calendar" | "spotify" | "system" | "memory" | "settings" | "debug";
+type View = "chat" | "calendar" | "spotify" | "system" | "memory" | "settings";
 type IconName = View | "send" | "mic" | "stop" | "refresh" | "spark" | "copy";
-const NAV: Array<[View, string]> = [["chat", "Chat"], ["calendar", "Calendar"], ["spotify", "Spotify"], ["system", "System"], ["memory", "Memory"], ["settings", "Settings"], ["debug", "Debug"]];
+const NAV: Array<[View, string]> = [["chat", "Chat"], ["calendar", "Calendar"], ["spotify", "Spotify"], ["system", "System"], ["memory", "Memory"], ["settings", "Settings"]];
 const STATUS: Record<AssistantStatus, string> = { standby: "Ready", listening: "Listening", thinking: "Thinking", speaking: "Speaking", error: "Needs attention" };
 const ICONS: Record<IconName, ReactNode> = {
   chat: <><path d="M4 5.5h16v11H9l-5 3v-14Z"/><path d="M8 10h8M8 13h5"/></>,
@@ -20,7 +20,7 @@ const ICONS: Record<IconName, ReactNode> = {
   settings: <><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H3v-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3V3h4v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></>,
   send: <path d="m5 12 14-7-4 14-3-6-7-1Zm7 1 3-3"/>, mic: <><rect x="9" y="3" width="6" height="12" rx="3"/><path d="M5 11a7 7 0 0 0 14 0m-7 7v3"/></>,
   stop: <rect x="7" y="7" width="10" height="10" rx="2"/>, refresh: <><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></>, spark: <path d="m12 3 1.6 5.4L19 10l-5.4 1.6L12 17l-1.6-5.4L5 10l5.4-1.6L12 3Z"/>,
-  debug: <><rect x="4" y="5" width="16" height="14" rx="2"/><path d="m8 10 2 2-2 2m4 0h4"/></>, copy: <><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></>
+  copy: <><rect x="8" y="8" width="11" height="11" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></>
 };
 function Icon({ name, size = 20 }: { name: IconName; size?: number }) { return <svg className="icon" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{ICONS[name]}</svg>; }
 function VoicePresence({ status, level = 0 }: { status: AssistantStatus; level?: number }) { return <div className={`voice-presence ${status}`} style={{ "--level": level } as React.CSSProperties}><div className="voice-halo"/><div className="voice-core"><span>θ</span></div></div>; }
@@ -34,7 +34,7 @@ function ChatView({ assistant }: { assistant: ReturnType<typeof useVoiceAssistan
   useEffect(() => { end.current?.scrollIntoView({ behavior: "smooth" }); }, [assistant.transcript, assistant.partial, assistant.activities, assistant.confirmation]);
   const send = (event: FormEvent) => { event.preventDefault(); if (!draft.trim()) return; void assistant.submitText(draft); setDraft(""); };
   const starters = ["What’s on my calendar today?", "How is my system doing?", "What do you remember about me?", "Research something for me"];
-  return <div className="chat-layout"><div className="chat-scroll">{assistant.transcript.length === 0 && <div className="chat-intro"><VoicePresence status={assistant.status} level={assistant.level} /><span className="eyebrow">YOUR DESKTOP, IN CONVERSATION</span><h1>What can I take care of?</h1><p>Speak naturally or type a request. Theta can work across your calendar, computer, memory and the web—with you in control.</p><div className="starter-grid">{starters.map((prompt) => <button key={prompt} onClick={() => void assistant.submitText(prompt)}><Icon name="spark" size={16}/><span>{prompt}</span></button>)}</div></div>}
+  return <div className="chat-layout"><div className="chat-scroll">{assistant.transcript.length === 0 && <div className="chat-intro"><VoicePresence status={assistant.status} level={assistant.level} /><span className="eyebrow">v0.2 iirc</span><h1>What can I take care of?</h1><p>Click the mic button to start or type smth</p><div className="starter-grid">{starters.map((prompt) => <button key={prompt} onClick={() => void assistant.submitText(prompt)}><Icon name="spark" size={16}/><span>{prompt}</span></button>)}</div></div>}
     {assistant.transcript.map((entry) => <article className={`message ${entry.role}`} key={entry.id}><div className="message-label">{entry.role === "user" ? "You" : "Theta"}<time>{new Date(entry.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time></div><div className="bubble">{entry.text}</div></article>) }
     {assistant.partial && <article className="message user partial"><div className="message-label">Listening</div><div className="bubble">{assistant.partial}</div></article>}
     {assistant.activities.map((item) => <div className={`tool-card ${item.status}`} key={item.id}><span className="tool-icon"><Icon name="spark" size={16}/></span><div><b>{item.name.replace(/_/g, " ")}</b><small>{item.message ?? item.status}</small></div><span className="tool-state">{item.status}</span></div>)}
@@ -73,18 +73,13 @@ function MemoryView() {
 }
 
 type CanvasStatus = { connected: boolean; baseUrl?: string };
-const SPEECH_PROVIDER_COPY: Record<SpeechProvider, string> = {
-  vosk: "Runs entirely on this device using the bundled offline model.",
-  windows: "Uses the Windows dictation service, following your Windows speech language and microphone privacy settings.",
-};
 function SettingsView({ assistant }: { assistant: ReturnType<typeof useVoiceAssistant> }) {
   const { settings, save } = { settings: assistant.settings, save: assistant.saveSettings };
   const voices = [["en-GB-SoniaNeural", "Sonia — British English"], ["en-GB-RyanNeural", "Ryan — British English"], ["en-GB-LibbyNeural", "Libby — British English"], ["en-US-AvaMultilingualNeural", "Ava — US English"], ["en-US-AndrewMultilingualNeural", "Andrew — US English"]];
   const [draft, setDraft] = useState(settings), [auth, setAuth] = useState<AuthStatus | null>(null), [clientId, setClientId] = useState(""), [secret, setSecret] = useState("");
   const [googleMessage, setGoogleMessage] = useState(""), [canvas, setCanvas] = useState<CanvasStatus | null>(null), [canvasUrl, setCanvasUrl] = useState(""), [canvasToken, setCanvasToken] = useState("");
-  const [canvasMessage, setCanvasMessage] = useState(""), [canvasLoading, setCanvasLoading] = useState(true), [speechProviders, setSpeechProviders] = useState<SpeechProviderCapability[]>([]);
+  const [canvasMessage, setCanvasMessage] = useState(""), [canvasLoading, setCanvasLoading] = useState(true);
   useEffect(() => setDraft(settings), [settings]);
-  useEffect(() => { void invoke<SpeechProviderCapability[]>("speech_providers").then(setSpeechProviders).catch(() => setSpeechProviders([])); }, []);
   const authRefresh = useCallback(() => invoke<AuthStatus>("google_auth_status").then(setAuth).catch((e) => setGoogleMessage(String(e))), []);
   const canvasRefresh = useCallback(async () => { setCanvasLoading(true);  try { const status = await invoke<CanvasStatus>("canvas_status"); setCanvas(status); setCanvasUrl((current) => current || status.baseUrl || ""); } catch (e) { setCanvas(null); setCanvasMessage(String(e)); } finally { setCanvasLoading(false); } }, []);
   useEffect(() => { void authRefresh(); void canvasRefresh(); }, [authRefresh, canvasRefresh]);
@@ -96,11 +91,8 @@ function SettingsView({ assistant }: { assistant: ReturnType<typeof useVoiceAssi
   const canvasDisconnect = async () => { if (!window.confirm("Disconnect Canvas LMS from Theta?")) return; setCanvasLoading(true);  try { await invoke("canvas_disconnect"); setCanvasMessage("Canvas LMS disconnected."); setCanvasUrl(""); await canvasRefresh(); } catch (e) { setCanvasMessage(String(e)); setCanvasLoading(false); } };
   const canvasConnected = Boolean(canvas?.connected);
   const canvasHost = (() => { const value = canvas?.baseUrl || canvasUrl; if (!value) return ""; try { return new URL(value).host; } catch { return "Configured host"; } })();
-  const providerOptions = speechProviders.length ? speechProviders : [{ id: draft.speechRecognitionProvider, label: draft.speechRecognitionProvider === "windows" ? "Windows Speech Recognition" : "Vosk", supported: true }];
-  const activeProvider = providerOptions.find(({ id }) => id === draft.speechRecognitionProvider);
   return <Panel title="Settings" subtitle="Private connections, tuned to your workflow" action={<button className="primary" onClick={() => void save(draft)}>Save changes</button>}><div className="settings-grid integrations-mosaic">
     <section className="card form-stack integration-card"><div className="integration-head"><div><span className="card-kicker"></span><h2>Model</h2></div><span className="connection-badge connected">Ready</span></div><p className="muted">Choose the model that powers conversations and tools.</p><label>Model<input value={draft.model} onChange={(e) => set("model", e.target.value)} /></label></section>
-    <section className="card form-stack integration-card"><div className="integration-head"><div><span className="card-kicker"></span><h2>Speech recognition</h2></div><span className={`connection-badge ${activeProvider?.supported === false ? "" : "connected"}`}>{draft.speechRecognitionProvider === "windows" ? "Windows" : "Offline"}</span></div><p className="muted">{SPEECH_PROVIDER_COPY[draft.speechRecognitionProvider]}</p><label>Engine<select value={draft.speechRecognitionProvider} onChange={(e) => set("speechRecognitionProvider", e.target.value as SpeechProvider)}>{providerOptions.map(({ id, label, supported }) => <option value={id} key={id} disabled={!supported}>{supported ? label : `${label} — not available here`}</option>)}</select></label>{activeProvider?.supported === false && <p className="integration-message" role="status">{activeProvider.label} isn’t available on this platform. Pick another engine before saving.</p>}{draft.speechRecognitionProvider !== settings.speechRecognitionProvider && assistant.isListening && <p className="integration-message" role="status">Saving will stop the current listening session.</p>}</section>
     <section className="card form-stack integration-card"><div className="integration-head"><div><span className="card-kicker"></span><h2>Voice</h2></div><span className="connection-badge connected">Local</span></div><label>Neural voice<select value={draft.voice} onChange={(e) => set("voice", e.target.value)}>{!voices.some(([id]) => id === draft.voice) && <option value={draft.voice}>{draft.voice}</option>}{voices.map(([id, label]) => <option value={id} key={id}>{label}</option>)}</select></label><label className="toggle"><input type="checkbox" checked={draft.speakReplies} onChange={(e) => set("speakReplies", e.target.checked)} /><span />Speak replies</label><button type="button" className="voice-test" disabled={assistant.isTestingVoice} onClick={() => void assistant.testVoice(draft.voice)}>{assistant.isTestingVoice ? "Testing voice…" : "Test this voice"}</button>{assistant.speechDiagnostic && <p className="diagnostic">{assistant.speechDiagnostic.detail}{assistant.speechDiagnostic.firstAudioMs ? ` · ${assistant.speechDiagnostic.firstAudioMs} ms` : ""}</p>}</section>
     <section className="card form-stack integration-card compact-card"><div className="integration-head"><div><span className="card-kicker"></span><h2>Web search</h2></div><span className={`connection-badge ${draft.allowWeb ? "connected" : ""}`}>{draft.allowWeb ? "Enabled" : "Off"}</span></div><p className="muted">Let Theta search and read public web pages.</p><label className="toggle"><input type="checkbox" checked={draft.allowWeb} onChange={(e) => set("allowWeb", e.target.checked)} /><span />Allow web research</label></section>
     <section className="card form-stack integration-card compact-card"><div className="integration-head"><div><span className="card-kicker"></span><h2>Local memory</h2></div><span className={`connection-badge ${draft.useRag ? "connected" : ""}`}>{draft.useRag ? "Enabled" : "Off"}</span></div><p className="muted">Use locally indexed notes and profile context.</p><label className="toggle"><input type="checkbox" checked={draft.useRag} onChange={(e) => set("useRag", e.target.checked)} /><span />Use local memory</label></section>
@@ -109,14 +101,9 @@ function SettingsView({ assistant }: { assistant: ReturnType<typeof useVoiceAssi
     {integrationCards().map(({ id, component: Integration }) => <Integration key={id} />)}
   </div></Panel>;
 }
-function DebugView({ assistant }: { assistant: ReturnType<typeof useVoiceAssistant> }) {
-  const lines = assistant.debugLogs;
-  const copy = () => void navigator.clipboard.writeText(lines.join("\n"));
-  return <Panel title="Debug console" subtitle="Runtime errors, voice diagnostics and backend events" action={<button onClick={copy} disabled={!lines.length}><Icon name="copy" size={15}/> Copy logs</button>}><div className="debug-summary"><span><b>{lines.length}</b> captured events</span><span>Speech input: <b>{assistant.settings.speechRecognitionProvider === "windows" ? "Windows" : "Vosk"}</b></span><span>Voice: <b>{assistant.speechDiagnostic?.stage ?? "idle"}</b></span>{assistant.speechDiagnostic?.firstAudioMs !== undefined && <span>First audio: <b>{assistant.speechDiagnostic.firstAudioMs} ms</b></span>}</div><div className="debug-console" role="log" aria-live="polite">{lines.length ? lines.map((line, index) => <div key={`${index}-${line}`}><span>{String(index + 1).padStart(3, "0")}</span><code>{line}</code></div>) : <Empty>No runtime errors captured yet.</Empty>}</div></Panel>;
-}
 function App() {
   const assistant = useVoiceAssistant(); const [view, setView] = useState<View>("chat");
-  const content = useMemo(() => { switch (view) { case "chat": return <ChatView assistant={assistant} />; case "calendar": return <CalendarView calendarId={assistant.settings.calendarId} />; case "spotify": return <SpotifyPlayer />; case "system": return <SystemView />; case "memory": return <MemoryView />; case "settings": return <SettingsView assistant={assistant} />; case "debug": return <DebugView assistant={assistant} />; } }, [assistant, view]);
+  const content = useMemo(() => { switch (view) { case "chat": return <ChatView assistant={assistant} />; case "calendar": return <CalendarView calendarId={assistant.settings.calendarId} />; case "spotify": return <SpotifyPlayer />; case "system": return <SystemView />; case "memory": return <MemoryView />; case "settings": return <SettingsView assistant={assistant} />; } }, [assistant, view]);
   return <div className="app"><WindowChrome /><div className="workspace"><nav className="nav-rail" aria-label="Main navigation"><div className="nav-items">{NAV.map(([id, label]) => <button key={id} className={view === id ? "selected" : ""} onClick={() => setView(id)} aria-label={label} title={label}><Icon name={id}/><small>{label}</small></button>)}</div><div className={`status-pill ${assistant.status}`}><VoicePresence status={assistant.status} level={assistant.level}/><span>{STATUS[assistant.status]}</span></div></nav><main className="content">{content}</main></div>{assistant.errorMessage && <button className="error-bar" onClick={() => assistant.setErrorMessage("")}>{assistant.errorMessage}<span>×</span></button>}<div className="toasts" aria-live="polite">{assistant.toasts.map((toast) => <div className={`toast ${toast.tone}`} key={toast.id}>{toast.text}</div>)}</div></div>;
 }
 export default App;

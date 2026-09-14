@@ -112,6 +112,7 @@ struct TokenResponse {
     scope: Option<String>,
 }
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Profile {
     email_address: String,
 }

@@ -3,7 +3,6 @@ import { GmailSettingsCard } from "../components/integrations/GmailSettingsCard"
 import { GitHubSettingsCard } from "../components/integrations/GitHubSettingsCard";
 import { HackatimeSettingsCard } from "../components/integrations/HackatimeSettingsCard";
 import { MineStratorSettingsCard } from "../components/integrations/MineStratorSettingsCard";
-import { NotionSettingsCard } from "../components/integrations/NotionSettingsCard";
 import { SpotifySettingsCard } from "../components/integrations/SpotifySettingsCard";
 import { OpenRouterSettingsCard } from "../components/integrations/OpenRouterSettingsCard";
 import { FirecrawlSettingsCard } from "../components/integrations/FirecrawlSettingsCard";
@@ -20,7 +19,6 @@ const cards: IntegrationCardRegistration[] = [
   { id: "hackatime", component: HackatimeSettingsCard },
   { id: "github", component: GitHubSettingsCard },
   { id: "gmail", component: GmailSettingsCard },
-  { id: "notion", component: NotionSettingsCard },
   { id: "minestrator", component: MineStratorSettingsCard },
 ];
 
