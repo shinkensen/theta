@@ -49,3 +49,10 @@ Theta has two distinct local memory systems:
 
 - **RAG memory** stores any documents that the user gives for future use.
 - **About Me profile** automatically infers any hobbies, interests, or ideas that the user has and stores them here.
+
+
+DEMO:
+
+https://jumpshare.com/share/CrjLJoMiXHLYL39Ur1cn?b=p5gWvuhjEwbYbLT8FjPY
+
+
